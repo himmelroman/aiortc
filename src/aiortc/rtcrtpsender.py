@@ -119,6 +119,9 @@ class RTCRtpSender:
         self.__stats = RTCStatsReport()
         self.__transport = transport
 
+        # encoded packet callback
+        self._encoded_packet_callback: Optional[Callable] = None
+
         # stats
         self.__lsr: Optional[int] = None
         self.__lsr_time: Optional[float] = None
@@ -153,6 +156,24 @@ class RTCRtpSender:
         transmitted.
         """
         return self.__transport
+
+    @property
+    def encoded_packet_callback(self) -> Optional[Callable]:
+        """
+        Callback for encoded packets (follows WebRTC's EncodedImageCallback pattern).
+
+        The callback receives av.Packet objects with metadata:
+        - is_keyframe: Boolean indicating keyframe
+        - pts: Presentation timestamp
+        - dts: Decode timestamp
+        - duration: Packet duration
+        - size: Packet size in bytes
+        """
+        return self._encoded_packet_callback
+
+    @encoded_packet_callback.setter
+    def encoded_packet_callback(self, callback: Optional[Callable]) -> None:
+        self._encoded_packet_callback = callback
 
     @classmethod
     def getCapabilities(self, kind: str) -> RTCRtpCapabilities:
@@ -315,9 +336,14 @@ class RTCRtpSender:
 
             force_keyframe = self.__force_keyframe
             self.__force_keyframe = False
-            payloads, timestamp = await self.__loop.run_in_executor(
+            payloads, packets, timestamp = await self.__loop.run_in_executor(
                 None, self.__encoder.encode, data, force_keyframe
             )
+
+            # Invoke encoded packet callback (synchronous, matches WebRTC threading model)
+            if self._encoded_packet_callback:
+                for packet in packets:
+                    self._encoded_packet_callback(packet)
         else:
             # Pack the pre-encoded data.
             payloads, timestamp = self.__encoder.pack(data)

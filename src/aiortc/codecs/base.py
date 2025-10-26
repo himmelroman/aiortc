@@ -16,7 +16,20 @@ class Encoder(metaclass=ABCMeta):
     @abstractmethod
     def encode(
         self, frame: Frame, force_keyframe: bool = False
-    ) -> tuple[list[bytes], int]:
+    ) -> tuple[list[bytes], list[Packet], int]:
+        """
+        Encode a frame.
+
+        Args:
+            frame: Frame to encode
+            force_keyframe: Force keyframe generation
+
+        Returns:
+            Tuple of (payloads, packets, timestamp):
+            - payloads: List of RTP payload bytes
+            - packets: List of encoded av.Packet objects
+            - timestamp: RTP timestamp
+        """
         pass  # pragma: no cover
 
     @abstractmethod

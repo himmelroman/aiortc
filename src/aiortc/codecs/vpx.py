@@ -189,7 +189,7 @@ class Vp8Encoder(Encoder):
 
     def encode(
         self, frame: Frame, force_keyframe: bool = False
-    ) -> tuple[list[bytes], int]:
+    ) -> tuple[list[bytes], list[Packet], int]:
         assert isinstance(frame, VideoFrame)
         if frame.format.name != "yuv420p":
             frame = frame.reformat(format="yuv420p")
@@ -236,15 +236,18 @@ class Vp8Encoder(Encoder):
                 frame.width * frame.height, multiprocessing.cpu_count()
             )
 
+        # Collect packets and data_to_send
+        packets = []
         data_to_send = b""
         for package in self.codec.encode(frame):
+            packets.append(package)
             data_to_send += bytes(package)
 
         # Packetize.
         payloads = self._packetize(data_to_send, self.picture_id)
         timestamp = convert_timebase(frame.pts, frame.time_base, VIDEO_TIME_BASE)
         self.picture_id = (self.picture_id + 1) % (1 << 15)
-        return payloads, timestamp
+        return payloads, packets, timestamp
 
     def pack(self, packet: Packet) -> tuple[list[bytes], int]:
         payloads = self._packetize(bytes(packet), self.picture_id)

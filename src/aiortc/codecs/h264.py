@@ -127,6 +127,7 @@ class H264Encoder(Encoder):
         self.buffer_pts: Optional[int] = None
         self.codec: Optional[VideoCodecContext] = None
         self.__target_bitrate = DEFAULT_BITRATE
+        self._packets: list[Packet] = []
 
     @staticmethod
     def _packetize_fu_a(data: bytes) -> list[bytes]:
@@ -280,8 +281,11 @@ class H264Encoder(Encoder):
             }
             self.codec.profile = "Baseline"
 
+        # Collect packets and data_to_send
+        self._packets = []
         data_to_send = b""
         for package in self.codec.encode(frame):
+            self._packets.append(package)
             data_to_send += bytes(package)
 
         if data_to_send:
@@ -289,11 +293,13 @@ class H264Encoder(Encoder):
 
     def encode(
         self, frame: Frame, force_keyframe: bool = False
-    ) -> tuple[list[bytes], int]:
+    ) -> tuple[list[bytes], list[Packet], int]:
         assert isinstance(frame, av.VideoFrame)
         packages = self._encode_frame(frame, force_keyframe)
+        payloads = self._packetize(packages)
         timestamp = convert_timebase(frame.pts, frame.time_base, VIDEO_TIME_BASE)
-        return self._packetize(packages), timestamp
+        packets = self._packets
+        return payloads, packets, timestamp
 
     def pack(self, packet: Packet) -> tuple[list[bytes], int]:
         assert isinstance(packet, av.Packet)
