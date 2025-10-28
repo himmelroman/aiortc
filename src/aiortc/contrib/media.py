@@ -553,6 +553,7 @@ class RelayStreamTrack(MediaStreamTrack):
         if self._frame is None:
             self.stop()
             raise MediaStreamError
+
         return self._frame
 
     def stop(self) -> None:

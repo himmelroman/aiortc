@@ -190,7 +190,19 @@ class Vp8Encoder(Encoder):
     def encode(
         self, frame: Frame, force_keyframe: bool = False
     ) -> tuple[list[bytes], list[Packet], int]:
+        # ABSOLUTELY CREATE THIS FILE!
+        import time
+        import os
+        marker_path = '/tmp/vp8_encode_DEFINITELY_CALLED.txt'
+        os.makedirs(os.path.dirname(marker_path), exist_ok=True)
+        with open(marker_path, 'a') as f:
+            f.write(f"✅ ENCODE CALLED AT {time.time()} - PID={os.getpid()}\n")
+            f.flush()
+            os.fsync(f.fileno())
+
+        encode_start = time.time()
         assert isinstance(frame, VideoFrame)
+
         if frame.format.name != "yuv420p":
             frame = frame.reformat(format="yuv420p")
 
@@ -247,6 +259,8 @@ class Vp8Encoder(Encoder):
         payloads = self._packetize(data_to_send, self.picture_id)
         timestamp = convert_timebase(frame.pts, frame.time_base, VIDEO_TIME_BASE)
         self.picture_id = (self.picture_id + 1) % (1 << 15)
+
+        encode_duration = time.time() - encode_start
         return payloads, packets, timestamp
 
     def pack(self, packet: Packet) -> tuple[list[bytes], int]:

@@ -67,6 +67,10 @@ class JitterBuffer:
         remove = 0
         timestamp = None
 
+        # TIMING: Track _remove_frame calls
+        import time
+        remove_frame_start = time.time()
+
         for count in range(self.capacity):
             pos = (self._origin + count) % self._capacity
             packet = self._packets[pos]
@@ -85,6 +89,7 @@ class JitterBuffer:
 
                 # check we have prefetched enough
                 frames += 1
+
                 if frames >= self._prefetch:
                     self.remove(remove)
                     return frame

@@ -7,7 +7,7 @@ import uuid
 from collections.abc import Callable
 from typing import Optional, Union
 
-from av import AudioFrame
+from av import AudioFrame, VideoFrame
 from av.frame import Frame
 
 from . import clock, rtp
@@ -317,7 +317,6 @@ class RTCRtpSender:
     ) -> Optional[RTCEncodedFrame]:
         # Get [Frame|Packet].
         data = await self.__track.recv()
-
         # If the sender is disabled, drop the frame instead of encoding it.
         # We still want to read from the track in order to avoid frames
         # accumulating in memory.
@@ -336,9 +335,10 @@ class RTCRtpSender:
 
             force_keyframe = self.__force_keyframe
             self.__force_keyframe = False
-            payloads, packets, timestamp = await self.__loop.run_in_executor(
+            result = await self.__loop.run_in_executor(
                 None, self.__encoder.encode, data, force_keyframe
             )
+            payloads, packets, timestamp = result
 
             # Invoke encoded packet callback (synchronous, matches WebRTC threading model)
             if self._encoded_packet_callback:
@@ -431,11 +431,13 @@ class RTCRtpSender:
                     self.__octet_count += len(payload)
                     self.__packet_count += 1
                     sequence_number = uint16_add(sequence_number, 1)
-        except (asyncio.CancelledError, ConnectionError, MediaStreamError):
+        except (asyncio.CancelledError, ConnectionError, MediaStreamError) as e:
+            print(f"🔴 RTPSender id={id(self)}: _run_rtp() exited with expected exception: {type(e).__name__}: {e}")
             pass
-        except Exception:
+        except Exception as e:
             # we *need* to set __rtp_exited, otherwise RTCRtpSender.stop() will hang,
             # so issue a warning if we hit an unexpected exception
+            print(f"🔴 RTPSender id={id(self)}: _run_rtp() caught unexpected exception: {type(e).__name__}: {e}")
             self.__log_warning(traceback.format_exc())
 
         # stop track
@@ -446,6 +448,7 @@ class RTCRtpSender:
         # release encoder
         self.__encoder = None
 
+        print(f"🟢 RTPSender id={id(self)}: _run_rtp() FINISHED")
         self.__log_debug("- RTP finished")
         self.__rtp_exited.set()
 

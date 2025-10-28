@@ -529,6 +529,7 @@ class RTCRtpReceiver:
 
         # try to re-assemble encoded frame
         pli_flag, encoded_frame = self.__jitter_buffer.add(packet)
+
         # check if the PLI should be sent
         if pli_flag:
             await self._send_rtcp_pli(packet.ssrc)
@@ -538,6 +539,7 @@ class RTCRtpReceiver:
             encoded_frame.timestamp = self.__timestamp_mapper.map(
                 encoded_frame.timestamp
             )
+
             self.__decoder_queue.put((codec, encoded_frame))
 
     async def _run_rtcp(self) -> None:
