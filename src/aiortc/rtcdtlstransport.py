@@ -604,9 +604,11 @@ class RTCDtlsTransport(AsyncIOEventEmitter):
             pt = data[1]
             fmt = data[0] & 0x1F
             if pt == 205 and fmt == 15:
+                self.__log_debug("< TWCC feedback packet PT=%d FMT=%d, %d bytes", pt, fmt, len(data))
                 # This is a TWCC packet, route it to all senders with GCC enabled
                 for sender in self._rtp_router.senders.values():
                     if hasattr(sender, '_RTCRtpSender__gcc_estimator') and sender._RTCRtpSender__gcc_estimator is not None:
+                        self.__log_debug("  routing to sender with GCC")
                         await sender._process_twcc_feedback(data)
                 return
 

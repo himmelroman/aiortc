@@ -336,7 +336,9 @@ class RTCRtpSender:
 
     async def _process_twcc_feedback(self, rtcp_data: bytes) -> None:
         """Process TWCC feedback and update GCC bandwidth estimate."""
+        self.__log_debug("_process_twcc_feedback called with %d bytes", len(rtcp_data))
         if self.__gcc_estimator is None or self.__sent_packet_tracker is None:
+            self.__log_debug("  GCC estimator or tracker is None")
             return
 
         from .contrib.gcc.estimator import PacketFeedbackProcessor
@@ -345,7 +347,9 @@ class RTCRtpSender:
         # Parse TWCC feedback
         results = TWCCParser.parse_feedback(rtcp_data)
         if not results:
+            self.__log_debug("  TWCCParser returned no results")
             return
+        self.__log_debug("  Parsed %d packet results from TWCC", len(results))
 
         # Get sent packet info
         min_seq = min(r.sequence_number for r in results)

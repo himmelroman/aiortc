@@ -603,6 +603,7 @@ class RTCRtpReceiver:
                 if self.__twcc_recorder is not None:
                     feedback = self.__twcc_recorder.generate_feedback()
                     if feedback is not None:
+                        self.__log_debug("> TWCC feedback %d bytes", len(feedback))
                         await self._send_rtcp_raw(feedback)
 
         except asyncio.CancelledError:
