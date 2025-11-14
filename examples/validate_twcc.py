@@ -76,6 +76,9 @@ async def validate_twcc_gcc():
 
     print(f"   {'✅' if has_transport_cc else '❌'} Transport-CC extension in SDP: {has_transport_cc}")
 
+    if not has_transport_cc:
+        raise AssertionError("CRITICAL: Transport-CC extension NOT found in SDP! TWCC will not work.")
+
     # Apply offer to pc2
     print("📥 Applying offer to receiver...")
     await pc2.setRemoteDescription(pc1.localDescription)
@@ -125,15 +128,24 @@ async def validate_twcc_gcc():
     results['packets_sent'] = packets_sent > 0
     print(f"   {'✅' if packets_sent > 0 else '❌'} Packets sent: {packets_sent}")
 
+    if packets_sent == 0:
+        raise AssertionError("CRITICAL: No packets were sent!")
+
     # Check transport sequence numbers
     has_transport_seq = sender._RTCRtpSender__transport_seq_manager is not None
     results['transport_seq_active'] = has_transport_seq
     print(f"   {'✅' if has_transport_seq else '❌'} Transport sequence manager: {has_transport_seq}")
 
+    if not has_transport_seq:
+        raise AssertionError("CRITICAL: Transport sequence manager not initialized!")
+
     # Check sent packet tracker
     has_tracker = sender._RTCRtpSender__sent_packet_tracker is not None
     results['sent_packet_tracker'] = has_tracker
     print(f"   {'✅' if has_tracker else '❌'} Sent packet tracker: {has_tracker}")
+
+    if not has_tracker:
+        raise AssertionError("CRITICAL: Sent packet tracker not initialized!")
 
     # Check GCC estimator
     print("\n📈 Checking GCC estimator...")
@@ -152,6 +164,7 @@ async def validate_twcc_gcc():
         results['gcc_stats'] = None
         print(f"   ❌ GCC estimator not initialized")
         results['gcc_received_feedback'] = False
+        raise AssertionError("CRITICAL: GCC estimator not initialized!")
 
     # Check encoder bitrate
     print("\n🎛️  Checking encoder...")
@@ -170,6 +183,9 @@ async def validate_twcc_gcc():
             has_twcc_recorder = receiver._RTCRtpReceiver__twcc_recorder is not None
             results['twcc_recorder_active'] = has_twcc_recorder
             print(f"   {'✅' if has_twcc_recorder else '❌'} TWCC recorder: {has_twcc_recorder}")
+
+            if not has_twcc_recorder:
+                raise AssertionError("CRITICAL: TWCC recorder not initialized on receiver!")
 
     # Overall result
     print("\n" + "="*60)
