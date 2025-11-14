@@ -276,10 +276,12 @@ class RTCRtpReceiver:
             self.__jitter_buffer = JitterBuffer(capacity=16, prefetch=4)
             self.__nack_generator = None
             self.__remote_bitrate_estimator = None
+            self.__twcc_recorder = None
         else:
             self.__jitter_buffer = JitterBuffer(capacity=128, is_video=True)
             self.__nack_generator = NackGenerator()
             self.__remote_bitrate_estimator = RemoteBitrateEstimator()
+            self.__twcc_recorder = None  # Will be initialized when TWCC is enabled
         self._track: Optional[RemoteStreamTrack] = None
         self.__rtcp_exited = asyncio.Event()
         self.__rtcp_started = asyncio.Event()
@@ -402,6 +404,19 @@ class RTCRtpReceiver:
     def setTransport(self, transport: RTCDtlsTransport) -> None:
         self.__transport = transport
 
+    def enable_twcc(self, ssrc: int) -> None:
+        """
+        Enable Transport-Wide Congestion Control (TWCC) feedback.
+
+        Args:
+            ssrc: The SSRC to use for TWCC feedback packets
+        """
+        if self.__twcc_recorder is None:
+            from .contrib.twcc.receiver import TWCCRecorder
+
+            self.__twcc_recorder = TWCCRecorder(media_ssrc=ssrc)
+            self.__log_debug("TWCC enabled with SSRC %d", ssrc)
+
     async def stop(self) -> None:
         """
         Irreversibly stop the receiver.
@@ -476,6 +491,13 @@ class RTCRtpReceiver:
                         fci=pack_remb_fci(*remb),
                     )
                     await self._send_rtcp(rtcp_packet)
+
+        # record TWCC packet
+        if self.__twcc_recorder is not None:
+            if packet.extensions.transport_sequence_number is not None:
+                self.__twcc_recorder.record_packet(
+                    packet.extensions.transport_sequence_number
+                )
 
         # keep track of sources
         self.__active_ssrc[packet.ssrc] = clock.current_datetime()
@@ -577,6 +599,12 @@ class RTCRtpReceiver:
                     packet = RtcpRrPacket(ssrc=self.__rtcp_ssrc, reports=reports)
                     await self._send_rtcp(packet)
 
+                # TWCC feedback
+                if self.__twcc_recorder is not None:
+                    feedback = self.__twcc_recorder.generate_feedback()
+                    if feedback is not None:
+                        await self._send_rtcp_raw(feedback)
+
         except asyncio.CancelledError:
             pass
 
@@ -587,6 +615,13 @@ class RTCRtpReceiver:
         self.__log_debug("> %s", packet)
         try:
             await self.transport._send_rtp(bytes(packet))
+        except ConnectionError:
+            pass
+
+    async def _send_rtcp_raw(self, data: bytes) -> None:
+        """Send raw RTCP data (for TWCC feedback)."""
+        try:
+            await self.transport._send_rtp(data)
         except ConnectionError:
             pass
 

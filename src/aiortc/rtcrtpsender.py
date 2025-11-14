@@ -128,6 +128,11 @@ class RTCRtpSender:
         self.__packet_count = 0
         self.__rtt: Optional[float] = None
 
+        # TWCC/GCC congestion control
+        self.__transport_seq_manager = None
+        self.__sent_packet_tracker = None
+        self.__gcc_estimator = None
+
         # logging
         self.__log_debug: Callable[..., None] = lambda *args: None
         if logger.isEnabledFor(logging.DEBUG):
@@ -200,6 +205,35 @@ class RTCRtpSender:
 
     def setTransport(self, transport: RTCDtlsTransport) -> None:
         self.__transport = transport
+
+    def enable_gcc(
+        self,
+        transport_seq_manager,
+        initial_bitrate: int = 300000,
+        min_bitrate: int = 30000,
+        max_bitrate: int = 2500000,
+    ) -> None:
+        """
+        Enable GCC congestion control with TWCC feedback.
+
+        Args:
+            transport_seq_manager: Shared transport sequence number manager
+            initial_bitrate: Initial bitrate in bps
+            min_bitrate: Minimum bitrate in bps
+            max_bitrate: Maximum bitrate in bps
+        """
+        if self.__gcc_estimator is None:
+            from .contrib.gcc.estimator import SenderSideBandwidthEstimator
+            from .contrib.twcc.sender import SentPacketTracker
+
+            self.__transport_seq_manager = transport_seq_manager
+            self.__sent_packet_tracker = SentPacketTracker()
+            self.__gcc_estimator = SenderSideBandwidthEstimator(
+                initial_bitrate=initial_bitrate,
+                min_bitrate=min_bitrate,
+                max_bitrate=max_bitrate,
+            )
+            self.__log_debug("GCC enabled (initial=%d bps)", initial_bitrate)
 
     async def send(self, parameters: RTCRtpSendParameters) -> None:
         """
@@ -290,6 +324,57 @@ class RTCRtpSender:
                         self.__encoder.target_bitrate = bitrate
             except ValueError:
                 pass
+        elif self.__gcc_estimator is not None:
+            # Try to parse as TWCC feedback (PT=205, FMT=15)
+            # TWCC comes as raw RTCP data, check packet type
+            packet_bytes = bytes(packet) if hasattr(packet, '__bytes__') else None
+            if packet_bytes and len(packet_bytes) >= 2:
+                pt = packet_bytes[1]
+                fmt = packet_bytes[0] & 0x1F
+                if pt == 205 and fmt == 15:
+                    await self._process_twcc_feedback(packet_bytes)
+
+    async def _process_twcc_feedback(self, rtcp_data: bytes) -> None:
+        """Process TWCC feedback and update GCC bandwidth estimate."""
+        if self.__gcc_estimator is None or self.__sent_packet_tracker is None:
+            return
+
+        from .contrib.gcc.estimator import PacketFeedbackProcessor
+        from .contrib.twcc.sender import TWCCParser
+
+        # Parse TWCC feedback
+        results = TWCCParser.parse_feedback(rtcp_data)
+        if not results:
+            return
+
+        # Get sent packet info
+        min_seq = min(r.sequence_number for r in results)
+        max_seq = max(r.sequence_number for r in results)
+        sent_packets = self.__sent_packet_tracker.get_range(min_seq, max_seq)
+
+        if not sent_packets:
+            return
+
+        # Extract reference time from RTCP packet
+        if len(rtcp_data) >= 19:
+            reference_time_24bit = int.from_bytes(rtcp_data[16:19], byteorder='big')
+            reference_time_us = reference_time_24bit * 64000
+        else:
+            reference_time_us = int(time.time() * 1_000_000)
+
+        # Process feedback
+        feedback = PacketFeedbackProcessor.process_feedback(
+            results, sent_packets, reference_time_us
+        )
+
+        # Update GCC estimate
+        if feedback:
+            estimate = self.__gcc_estimator.process_feedback(feedback)
+            if estimate is not None:
+                self.__log_debug("+ GCC bandwidth estimate %d bps", estimate)
+                # Apply to encoder
+                if self.__encoder and hasattr(self.__encoder, "target_bitrate"):
+                    self.__encoder.target_bitrate = estimate
 
     async def _next_encoded_frame(
         self, codec: RTCRtpCodecParameters
@@ -391,6 +476,17 @@ class RTCRtpSender:
                     packet.extensions.mid = self.__mid
                     if enc_frame.audio_level is not None:
                         packet.extensions.audio_level = (False, -enc_frame.audio_level)
+
+                    # set transport-wide sequence number (for TWCC/GCC)
+                    if self.__transport_seq_manager is not None:
+                        transport_seq = self.__transport_seq_manager.next()
+                        packet.extensions.transport_sequence_number = transport_seq
+
+                        # track sent packet
+                        if self.__sent_packet_tracker is not None:
+                            self.__sent_packet_tracker.add(
+                                seq=transport_seq, size=len(payload), ssrc=self._ssrc
+                            )
 
                     # send packet
                     self.__log_debug("> %s", packet)
