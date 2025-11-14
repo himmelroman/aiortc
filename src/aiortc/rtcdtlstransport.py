@@ -598,6 +598,18 @@ class RTCDtlsTransport(AsyncIOEventEmitter):
         return report
 
     async def _handle_rtcp_data(self, data: bytes) -> None:
+        # Check for TWCC feedback (PT=205, FMT=15) before parsing
+        # TWCC packets may not be recognized by standard RTCP parser
+        if len(data) >= 2:
+            pt = data[1]
+            fmt = data[0] & 0x1F
+            if pt == 205 and fmt == 15:
+                # This is a TWCC packet, route it to all senders with GCC enabled
+                for sender in self._rtp_router.senders.values():
+                    if hasattr(sender, '_RTCRtpSender__gcc_estimator') and sender._RTCRtpSender__gcc_estimator is not None:
+                        await sender._process_twcc_feedback(data)
+                return
+
         try:
             packets = RtcpPacket.parse(data)
         except ValueError as exc:
