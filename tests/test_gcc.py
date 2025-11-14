@@ -3,7 +3,7 @@ Tests for GCC bandwidth estimator.
 """
 
 import time
-import unittest
+from unittest import TestCase
 
 from aiortc.contrib.gcc.estimator import (
     DelayBasedController,
@@ -15,7 +15,7 @@ from aiortc.contrib.gcc.estimator import (
 from aiortc.contrib.twcc.sender import PacketResult, SentPacketInfo
 
 
-class TestPacketFeedback(unittest.TestCase):
+class PacketFeedbackTest(TestCase):
     """Test PacketFeedback dataclass."""
 
     def test_creation(self):
@@ -35,7 +35,7 @@ class TestPacketFeedback(unittest.TestCase):
         self.assertEqual(feedback.ssrc, 12345)
 
 
-class TestPacketFeedbackProcessor(unittest.TestCase):
+class PacketFeedbackProcessorTest(TestCase):
     """Test packet feedback processing."""
 
     def test_process_feedback_basic(self):
@@ -120,7 +120,7 @@ class TestPacketFeedbackProcessor(unittest.TestCase):
         self.assertEqual(feedback[0].sequence_number, 0)
 
 
-class TestDelayBasedController(unittest.TestCase):
+class DelayBasedControllerTest(TestCase):
     """Test delay-based bandwidth control."""
 
     def test_initialization(self):
@@ -167,7 +167,7 @@ class TestDelayBasedController(unittest.TestCase):
         self.assertIsNone(result)
 
 
-class TestLossBasedController(unittest.TestCase):
+class LossBasedControllerTest(TestCase):
     """Test loss-based bandwidth control."""
 
     def test_initialization(self):
@@ -222,7 +222,7 @@ class TestLossBasedController(unittest.TestCase):
         self.assertIsNotNone(result3)
 
 
-class TestSenderSideBandwidthEstimator(unittest.TestCase):
+class SenderSideBandwidthEstimatorTest(TestCase):
     """Test complete bandwidth estimator."""
 
     def test_initialization(self):
@@ -368,7 +368,7 @@ class TestSenderSideBandwidthEstimator(unittest.TestCase):
         # result2 might be None if no update was needed
 
 
-class TestIntegration(unittest.TestCase):
+class GCCIntegrationTest(TestCase):
     """Integration tests for GCC with TWCC."""
 
     def test_twcc_to_gcc_pipeline(self):
@@ -404,7 +404,3 @@ class TestIntegration(unittest.TestCase):
         # Should get an estimate
         self.assertIsNotNone(estimate)
         self.assertGreater(estimate, 0)
-
-
-if __name__ == "__main__":
-    unittest.main()

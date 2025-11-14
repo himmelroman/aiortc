@@ -18,7 +18,7 @@ import sys
 from pathlib import Path
 
 # Add src to path
-sys.path.insert(0, str(Path(__file__).parent / "src"))
+sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from aiortc import RTCPeerConnection
 from aiortc.contrib.twcc.receiver import TransportSequenceNumberManager
@@ -32,8 +32,8 @@ logger = logging.getLogger(__name__)
 
 
 # Import dummy tracks
-sys.path.insert(0, str(Path(__file__).parent / "tests"))
-from test_twcc_gcc_e2e_real import DummyVideoTrack
+sys.path.insert(0, str(Path(__file__).parent.parent / "tests"))
+from test_rtcpeerconnection_gcc import DummyVideoTrack
 
 
 async def validate_twcc_gcc():
