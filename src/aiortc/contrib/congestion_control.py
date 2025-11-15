@@ -129,7 +129,7 @@ class CongestionControlIntegration:
             return
 
         if self._gcc_estimator is None:
-            from aiortc.contrib.gcc.estimator import SenderSideBandwidthEstimator
+            from aiortc.gcc.estimator import SenderSideBandwidthEstimator
 
             self._gcc_estimator = SenderSideBandwidthEstimator(
                 initial_bitrate=self.config.initial_bitrate,
@@ -138,7 +138,7 @@ class CongestionControlIntegration:
             )
 
         if self._transport_seq_manager is None:
-            from aiortc.contrib.twcc.receiver import TransportSequenceNumberManager
+            from aiortc.twcc.receiver import TransportSequenceNumberManager
 
             self._transport_seq_manager = TransportSequenceNumberManager()
 
@@ -148,7 +148,7 @@ class CongestionControlIntegration:
             return None
 
         if ssrc not in self._twcc_recorders:
-            from aiortc.contrib.twcc.receiver import TWCCRecorder
+            from aiortc.twcc.receiver import TWCCRecorder
 
             self._twcc_recorders[ssrc] = TWCCRecorder(media_ssrc=ssrc)
 
@@ -160,7 +160,7 @@ class CongestionControlIntegration:
             return None
 
         if ssrc not in self._sent_trackers:
-            from aiortc.contrib.twcc.sender import SentPacketTracker
+            from aiortc.twcc.sender import SentPacketTracker
 
             self._sent_trackers[ssrc] = SentPacketTracker()
 
@@ -189,8 +189,8 @@ class CongestionControlIntegration:
         if not self.is_gcc_enabled():
             return None
 
-        from aiortc.contrib.gcc.estimator import PacketFeedbackProcessor
-        from aiortc.contrib.twcc.sender import TWCCParser
+        from aiortc.gcc.estimator import PacketFeedbackProcessor
+        from aiortc.twcc.sender import TWCCParser
 
         # Parse TWCC feedback
         twcc_results = TWCCParser.parse_feedback(rtcp_packet)

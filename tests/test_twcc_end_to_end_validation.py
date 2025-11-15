@@ -78,7 +78,7 @@ class TWCCEndToEndValidationTest(unittest.TestCase):
             sender = pc1.addTrack(track)
 
             # Enable GCC
-            from aiortc.contrib.twcc.receiver import TransportSequenceNumberManager
+            from aiortc.twcc.receiver import TransportSequenceNumberManager
             transport_seq_manager = TransportSequenceNumberManager()
             sender.enable_gcc(
                 transport_seq_manager,

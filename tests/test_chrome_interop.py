@@ -24,7 +24,7 @@ except ImportError:
     PLAYWRIGHT_AVAILABLE = False
 
 from aiortc import RTCPeerConnection, RTCSessionDescription
-from aiortc.contrib.twcc.receiver import TransportSequenceNumberManager
+from aiortc.twcc.receiver import TransportSequenceNumberManager
 
 logger = logging.getLogger(__name__)
 

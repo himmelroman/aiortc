@@ -1,6 +1,6 @@
 from unittest import TestCase
 
-from aiortc.contrib.twcc.receiver import (
+from aiortc.twcc.receiver import (
     LARGE_DELTA_US,
     MAX_SMALL_DELTA_US,
     PACKET_NOT_RECEIVED,
@@ -17,7 +17,7 @@ from aiortc.contrib.twcc.receiver import (
     TransportSequenceNumberManager,
     TWCCRecorder,
 )
-from aiortc.contrib.twcc.sender import (
+from aiortc.twcc.sender import (
     PacketChunkDecoder,
     PacketResult,
     ReceiveDeltaDecoder,

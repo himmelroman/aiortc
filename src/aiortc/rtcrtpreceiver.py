@@ -412,7 +412,7 @@ class RTCRtpReceiver:
             ssrc: The SSRC to use for TWCC feedback packets
         """
         if self.__twcc_recorder is None:
-            from .contrib.twcc.receiver import TWCCRecorder
+            from .twcc.receiver import TWCCRecorder
 
             self.__twcc_recorder = TWCCRecorder(media_ssrc=ssrc)
             self.__log_debug("TWCC enabled with SSRC %d", ssrc)

@@ -114,7 +114,7 @@ class TestTWCCGCCRealE2E(unittest.TestCase):
             sender = pc1.addTrack(track)
 
             # Enable TWCC/GCC on sender
-            from aiortc.contrib.twcc.receiver import TransportSequenceNumberManager
+            from aiortc.twcc.receiver import TransportSequenceNumberManager
             transport_seq_manager = TransportSequenceNumberManager()
             sender.enable_gcc(transport_seq_manager, initial_bitrate=500000)
 
@@ -168,7 +168,7 @@ class TestTWCCGCCRealE2E(unittest.TestCase):
             sender = pc1.addTrack(track)
 
             # Enable GCC with low initial bitrate
-            from aiortc.contrib.twcc.receiver import TransportSequenceNumberManager
+            from aiortc.twcc.receiver import TransportSequenceNumberManager
             transport_seq_manager = TransportSequenceNumberManager()
             sender.enable_gcc(transport_seq_manager, initial_bitrate=300000)
 
@@ -227,7 +227,7 @@ class TestTWCCGCCRealE2E(unittest.TestCase):
             pc2 = self.create_pc()
 
             # Add both video and audio tracks
-            from aiortc.contrib.twcc.receiver import TransportSequenceNumberManager
+            from aiortc.twcc.receiver import TransportSequenceNumberManager
             transport_seq_manager = TransportSequenceNumberManager()
 
             video_track = DummyVideoTrack()

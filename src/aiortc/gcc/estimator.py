@@ -20,7 +20,7 @@ from aiortc.rate import (
 )
 
 # TWCC feedback processing
-from aiortc.contrib.twcc.sender import PacketResult, SentPacketInfo
+from aiortc.twcc.sender import PacketResult, SentPacketInfo
 
 # Constants
 TIMESTAMP_GROUP_LENGTH_MS = 5

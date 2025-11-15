@@ -21,7 +21,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from aiortc import RTCPeerConnection
-from aiortc.contrib.twcc.receiver import TransportSequenceNumberManager
+from aiortc.twcc.receiver import TransportSequenceNumberManager
 
 # Configure logging
 logging.basicConfig(

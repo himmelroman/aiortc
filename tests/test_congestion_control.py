@@ -237,7 +237,7 @@ class TestIntegrationWithTWCC(unittest.TestCase):
 
     def test_process_twcc_feedback(self):
         """Test processing TWCC feedback."""
-        from aiortc.contrib.twcc.receiver import TWCCRecorder
+        from aiortc.twcc.receiver import TWCCRecorder
 
         integration = CongestionControlIntegration()
         integration.initialize_gcc()

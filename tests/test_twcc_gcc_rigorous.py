@@ -65,7 +65,7 @@ class RigorousTWCCGCCTest(unittest.TestCase):
             track = DummyVideoTrack(fps=30)
             sender = pc1.addTrack(track)
 
-            from aiortc.contrib.twcc.receiver import TransportSequenceNumberManager
+            from aiortc.twcc.receiver import TransportSequenceNumberManager
             transport_seq_manager = TransportSequenceNumberManager()
             sender.enable_gcc(
                 transport_seq_manager,
@@ -169,7 +169,7 @@ class RigorousTWCCGCCTest(unittest.TestCase):
             track = DummyVideoTrack(fps=30)
             sender = pc1.addTrack(track)
 
-            from aiortc.contrib.twcc.receiver import TransportSequenceNumberManager
+            from aiortc.twcc.receiver import TransportSequenceNumberManager
             transport_seq_manager = TransportSequenceNumberManager()
             sender.enable_gcc(transport_seq_manager, initial_bitrate=500000)
 
@@ -202,7 +202,7 @@ class RigorousTWCCGCCTest(unittest.TestCase):
             feedback_bytes = twcc_recorder.generate_feedback()
             self.assertIsNotNone(feedback_bytes, "Should generate feedback")
 
-            from aiortc.contrib.twcc.sender import TWCCParser
+            from aiortc.twcc.sender import TWCCParser
             feedback_results = TWCCParser.parse_feedback(feedback_bytes)
             self.assertIsNotNone(feedback_results, "Should parse feedback")
             self.assertGreater(len(feedback_results), 0, "Feedback should have results")
@@ -271,7 +271,7 @@ class RigorousTWCCGCCTest(unittest.TestCase):
             track = DummyVideoTrack(fps=30)
             sender = pc1.addTrack(track)
 
-            from aiortc.contrib.twcc.receiver import TransportSequenceNumberManager
+            from aiortc.twcc.receiver import TransportSequenceNumberManager
             transport_seq_manager = TransportSequenceNumberManager()
             sender.enable_gcc(transport_seq_manager, initial_bitrate=500000)
 
@@ -328,14 +328,14 @@ class RigorousTWCCGCCTest(unittest.TestCase):
             logger.info(f"✓ SENDER: Tracked {len(sent_packets)} sent packets")
 
             # ASSERTION 6: Sender can parse TWCC feedback
-            from aiortc.contrib.twcc.sender import TWCCParser
+            from aiortc.twcc.sender import TWCCParser
             parsed_results = TWCCParser.parse_feedback(feedback)
             self.assertIsNotNone(parsed_results, "Sender should parse TWCC feedback")
             self.assertGreater(len(parsed_results), 0, "Should parse packet results")
             logger.info(f"✓ SENDER: Parsed {len(parsed_results)} packet results from feedback")
 
             # ASSERTION 7: Can correlate feedback with sent packets
-            from aiortc.contrib.gcc.estimator import PacketFeedbackProcessor
+            from aiortc.gcc.estimator import PacketFeedbackProcessor
             min_seq = min(r.sequence_number for r in parsed_results)
             max_seq = max(r.sequence_number for r in parsed_results)
             correlated_sent = sent_tracker.get_range(min_seq, max_seq)

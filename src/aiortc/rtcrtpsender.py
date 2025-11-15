@@ -223,8 +223,8 @@ class RTCRtpSender:
             max_bitrate: Maximum bitrate in bps
         """
         if self.__gcc_estimator is None:
-            from .contrib.gcc.estimator import SenderSideBandwidthEstimator
-            from .contrib.twcc.sender import SentPacketTracker
+            from .gcc.estimator import SenderSideBandwidthEstimator
+            from .twcc.sender import SentPacketTracker
 
             self.__transport_seq_manager = transport_seq_manager
             self.__sent_packet_tracker = SentPacketTracker()
@@ -352,8 +352,8 @@ class RTCRtpSender:
             self.__log_debug("  GCC estimator or tracker is None")
             return
 
-        from .contrib.gcc.estimator import PacketFeedbackProcessor
-        from .contrib.twcc.sender import TWCCParser
+        from .gcc.estimator import PacketFeedbackProcessor
+        from .twcc.sender import TWCCParser
 
         # Parse TWCC feedback
         results = TWCCParser.parse_feedback(rtcp_data)

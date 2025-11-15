@@ -5,14 +5,14 @@ Tests for GCC bandwidth estimator.
 import time
 from unittest import TestCase
 
-from aiortc.contrib.gcc.estimator import (
+from aiortc.gcc.estimator import (
     DelayBasedController,
     LossBasedController,
     PacketFeedback,
     PacketFeedbackProcessor,
     SenderSideBandwidthEstimator,
 )
-from aiortc.contrib.twcc.sender import PacketResult, SentPacketInfo
+from aiortc.twcc.sender import PacketResult, SentPacketInfo
 
 
 class PacketFeedbackTest(TestCase):
@@ -373,7 +373,7 @@ class GCCIntegrationTest(TestCase):
 
     def test_twcc_to_gcc_pipeline(self):
         """Test complete pipeline from TWCC to GCC."""
-        from aiortc.contrib.twcc.sender import SentPacketTracker
+        from aiortc.twcc.sender import SentPacketTracker
 
         # Set up components
         estimator = SenderSideBandwidthEstimator(initial_bitrate=300000)
