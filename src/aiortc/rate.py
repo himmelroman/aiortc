@@ -86,7 +86,11 @@ class AimdRateControl:
         elif bandwidth_usage == BandwidthUsage.OVERUSING:
             self.state = RateControlState.DECREASE
         elif bandwidth_usage == BandwidthUsage.UNDERUSING:
-            self.state = RateControlState.HOLD
+            # UNDERUSING means network has capacity - we should increase!
+            # This was previously HOLD, which prevented GCC from ramping up
+            if self.state != RateControlState.INCREASE:
+                self.last_change_ms = now_ms
+            self.state = RateControlState.INCREASE
 
         # helper variables
         new_bitrate = self.current_bitrate

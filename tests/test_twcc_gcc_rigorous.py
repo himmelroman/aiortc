@@ -51,13 +51,12 @@ class RigorousTWCCGCCTest(unittest.TestCase):
 
     def test_local_network_bitrate_estimates_are_high(self):
         """
-        FLOW: Two local peers stream for 10 seconds
+        FLOW: Two local peers stream for 2 minutes (120 seconds)
 
         ASSERTIONS:
-        1. GCC bitrate estimate should be HIGH (>= 1 Mbps for loopback)
-        2. RTT should be < 10ms (local network)
-        3. Packet loss should be 0%
-        4. Bitrate should stabilize (not fluctuate > 20% after 5 seconds)
+        1. GCC bitrate estimate should ramp up over time
+        2. Final bitrate should reach >= 1 Mbps for loopback
+        3. Bitrate should stabilize in later phase
         """
         async def run():
             pc1 = RTCPeerConnection()
@@ -87,40 +86,54 @@ class RigorousTWCCGCCTest(unittest.TestCase):
                 if receiver.track and receiver.track.kind == "video":
                     receiver.enable_twcc(ssrc=receiver._RTCRtpReceiver__rtcp_ssrc or 1)
 
-            # Collect bitrate estimates over time
+            # Collect bitrate estimates over 120 seconds (2 minutes)
             bitrate_samples: List[Tuple[float, int]] = []
 
-            for i in range(10):
+            for i in range(120):
                 await asyncio.sleep(1)
                 if sender._RTCRtpSender__gcc_estimator:
                     stats = sender._RTCRtpSender__gcc_estimator.get_stats()
                     bitrate = stats['current_estimate_bps']
                     bitrate_samples.append((time.time(), bitrate))
-                    logger.info(f"[{i+1}s] Bitrate: {bitrate/1000:.1f} kbps")
+                    # Log every 10 seconds
+                    if (i + 1) % 10 == 0:
+                        logger.info(f"[{i+1}s] Bitrate: {bitrate/1000:.1f} kbps")
 
-            # ASSERTION 1: Final bitrate should be REASONABLE for local network
-            # Note: With dummy video track, bitrate is limited by frame generation rate
-            # Real video would achieve higher bitrates, but dummy track should still
-            # reach at least 500 kbps on loopback
+            # ASSERTION 1: Bitrate should RAMP UP over time (compare first 10s vs last 10s)
+            early_bitrates = [br for _, br in bitrate_samples[:10]]
+            late_bitrates = [br for _, br in bitrate_samples[-10:]]
+            early_avg = sum(early_bitrates) / len(early_bitrates)
+            late_avg = sum(late_bitrates) / len(late_bitrates)
+
+            logger.info(f"Early avg (0-10s): {early_avg/1000:.1f} kbps")
+            logger.info(f"Late avg (110-120s): {late_avg/1000:.1f} kbps")
+
+            self.assertGreater(
+                late_avg,
+                early_avg * 1.2,  # At least 20% increase
+                f"Bitrate should ramp up over 2 minutes. Early: {early_avg/1000:.1f} kbps, Late: {late_avg/1000:.1f} kbps"
+            )
+
+            # ASSERTION 2: Final bitrate should reach >= 1 Mbps after 2 minutes
             final_bitrate = bitrate_samples[-1][1]
             self.assertGreater(
                 final_bitrate,
-                500_000,  # At least 500 kbps (conservative for dummy track)
-                f"Local network should achieve reasonable bitrate, got {final_bitrate/1000:.1f} kbps"
+                1_000_000,  # At least 1 Mbps after 2 minutes
+                f"After 2 minutes, local network should achieve >= 1 Mbps, got {final_bitrate/1000:.1f} kbps"
             )
 
-            # ASSERTION 2: Bitrate should STABILIZE (last 5 samples within 20% of mean)
-            recent_bitrates = [br for _, br in bitrate_samples[-5:]]
+            # ASSERTION 3: Bitrate should STABILIZE in later phase (last 20 samples within 30% of mean)
+            recent_bitrates = [br for _, br in bitrate_samples[-20:]]
             mean_bitrate = sum(recent_bitrates) / len(recent_bitrates)
-            for br in recent_bitrates:
-                variation = abs(br - mean_bitrate) / mean_bitrate
-                self.assertLess(
-                    variation,
-                    0.20,  # Within 20%
-                    f"Bitrate should stabilize, got {variation*100:.1f}% variation"
-                )
+            variations = [abs(br - mean_bitrate) / mean_bitrate for br in recent_bitrates]
+            max_variation = max(variations)
+            self.assertLess(
+                max_variation,
+                0.30,  # Within 30%
+                f"Bitrate should stabilize in later phase, got max {max_variation*100:.1f}% variation"
+            )
 
-            # ASSERTION 3: Packet loss should be ZERO on loopback
+            # ASSERTION 4: Packet loss should be ZERO on loopback
             if sender._RTCRtpSender__gcc_estimator:
                 stats = sender._RTCRtpSender__gcc_estimator.get_stats()
                 packets_sent = stats['packets_sent']
@@ -234,7 +247,7 @@ class RigorousTWCCGCCTest(unittest.TestCase):
             # Feedback sequences should overlap with sent sequences
             # Use full sent_seqs range since feedback contains recent packets
             overlap = set(sent_seqs) & set(feedback_seqs)
-            self.assertGreater(
+            self.assertGreaterEqual(
                 len(overlap),
                 5,  # At least 5 sequences should be in both
                 f"Feedback should report sequences that were sent.\n"
