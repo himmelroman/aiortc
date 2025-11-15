@@ -314,6 +314,11 @@ class RTCRtpSender:
         ):
             self._send_keyframe()
         elif isinstance(packet, RtcpPsfbPacket) and packet.fmt == RTCP_PSFB_APP:
+            # Skip REMB if GCC is enabled - they conflict!
+            if self.__gcc_estimator is not None:
+                self.__log_debug("- Ignoring REMB (GCC is active)")
+                return
+
             try:
                 bitrate, ssrcs = unpack_remb_fci(packet.fci)
                 if self._ssrc in ssrcs:
