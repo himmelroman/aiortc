@@ -321,7 +321,13 @@ class RTCRtpSender:
                         "- receiver estimated maximum bitrate %d bps", bitrate
                     )
                     if self.__encoder and hasattr(self.__encoder, "target_bitrate"):
+                        old_bitrate = self.__encoder.target_bitrate
                         self.__encoder.target_bitrate = bitrate
+                        new_bitrate = self.__encoder.target_bitrate
+                        self.__log_debug(
+                            "  REMB set encoder: %d -> %d bps (requested %d)",
+                            old_bitrate, new_bitrate, bitrate
+                        )
             except ValueError:
                 pass
         elif self.__gcc_estimator is not None:
@@ -378,7 +384,15 @@ class RTCRtpSender:
                 self.__log_debug("+ GCC bandwidth estimate %d bps", estimate)
                 # Apply to encoder
                 if self.__encoder and hasattr(self.__encoder, "target_bitrate"):
+                    old_bitrate = self.__encoder.target_bitrate
                     self.__encoder.target_bitrate = estimate
+                    new_bitrate = self.__encoder.target_bitrate
+                    self.__log_debug(
+                        "  Encoder bitrate: %d -> %d bps (requested %d)",
+                        old_bitrate, new_bitrate, estimate
+                    )
+                else:
+                    self.__log_debug("  Encoder not available or no target_bitrate property")
 
     async def _next_encoded_frame(
         self, codec: RTCRtpCodecParameters
