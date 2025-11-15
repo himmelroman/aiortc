@@ -495,15 +495,26 @@ class RateCounter:
 
     def _erase_old(self, now_ms: int) -> None:
         new_origin_ms = now_ms - self._window_size + 1
-        while self._origin_ms < new_origin_ms:
-            bucket = self._buckets[self._origin_index]
-            self._total.count -= bucket.count
-            self._total.value -= bucket.value
-            bucket.count = 0
-            bucket.value = 0
+        if self._origin_ms >= new_origin_ms:
+            return  # Nothing to erase
 
-            self._origin_index = (self._origin_index + 1) % self._window_size
-            self._origin_ms += 1
+        delta_ms = new_origin_ms - self._origin_ms
+
+        if delta_ms >= self._window_size:
+            # Entire window is old, reset everything
+            self.reset()
+            self._origin_ms = new_origin_ms
+        else:
+            # Erase old buckets - use range() to avoid infinite loop
+            for _ in range(delta_ms):
+                bucket = self._buckets[self._origin_index]
+                self._total.count -= bucket.count
+                self._total.value -= bucket.value
+                bucket.count = 0
+                bucket.value = 0
+
+                self._origin_index = (self._origin_index + 1) % self._window_size
+            self._origin_ms = new_origin_ms
 
 
 class RemoteBitrateEstimator:
