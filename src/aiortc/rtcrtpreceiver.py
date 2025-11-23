@@ -286,6 +286,9 @@ class RTCRtpReceiver:
         self.__rtcp_exited = asyncio.Event()
         self.__rtcp_started = asyncio.Event()
         self.__rtcp_task: Optional[asyncio.Future[None]] = None
+        self.__twcc_exited = asyncio.Event()
+        self.__twcc_started = asyncio.Event()
+        self.__twcc_task: Optional[asyncio.Future[None]] = None
         self.__rtx_ssrc: dict[int, int] = {}
         self.__started = False
         self.__stats = RTCStatsReport()
@@ -409,13 +412,24 @@ class RTCRtpReceiver:
         Enable Transport-Wide Congestion Control (TWCC) feedback.
 
         Args:
-            ssrc: The SSRC to use for TWCC feedback packets
+            ssrc: The media SSRC to track for TWCC feedback
         """
         if self.__twcc_recorder is None:
             from .twcc.receiver import TWCCRecorder
 
-            self.__twcc_recorder = TWCCRecorder(media_ssrc=ssrc)
-            self.__log_debug("TWCC enabled with SSRC %d", ssrc)
+            # CRITICAL: Pass sender_ssrc (our RTCP SSRC). Media SSRC will be auto-detected from RTP packets.
+            # This ensures TWCC packets have different SSRCs per RTCP spec
+            self.__twcc_recorder = TWCCRecorder(
+                sender_ssrc=self.__rtcp_ssrc
+            )
+            logger.info(f"✅ TWCC enabled with sender_ssrc={self.__rtcp_ssrc}, media_ssrc will be auto-detected")
+            self.__log_debug("TWCC enabled with sender SSRC %d (media SSRC will be auto-detected)", self.__rtcp_ssrc)
+
+            # Start dedicated TWCC feedback task with 100ms interval
+            if self.__twcc_task is None:
+                self.__twcc_task = asyncio.ensure_future(self._run_twcc())
+                logger.info("✅ TWCC feedback task started with 100ms interval")
+                self.__log_debug("TWCC feedback task started")
 
     async def stop(self) -> None:
         """
@@ -429,6 +443,12 @@ class RTCRtpReceiver:
             await self.__rtcp_started.wait()
             self.__rtcp_task.cancel()
             await self.__rtcp_exited.wait()
+
+            # shutdown TWCC task if it was started
+            if self.__twcc_task is not None:
+                await self.__twcc_started.wait()
+                self.__twcc_task.cancel()
+                await self.__twcc_exited.wait()
 
     def _handle_disconnect(self) -> None:
         self.__stop_decoder()
@@ -463,9 +483,13 @@ class RTCRtpReceiver:
         elif isinstance(packet, RtcpByePacket):
             self.__stop_decoder()
 
-    async def _handle_rtp_packet(self, packet: RtpPacket, arrival_time_ms: int) -> None:
+    async def _handle_rtp_packet(self, packet: RtpPacket, arrival_time_us: int) -> None:
         """
         Handle an incoming RTP packet.
+
+        Args:
+            packet: The RTP packet to handle
+            arrival_time_us: Packet arrival time in microseconds (monotonic clock)
         """
         self.__log_debug("< %s", packet)
 
@@ -473,7 +497,8 @@ class RTCRtpReceiver:
         if not self._enabled:
             return
 
-        # feed bitrate estimator
+        # feed bitrate estimator (requires milliseconds)
+        arrival_time_ms = arrival_time_us // 1000
         if self.__remote_bitrate_estimator is not None:
             if packet.extensions.abs_send_time is not None:
                 remb = self.__remote_bitrate_estimator.add(
@@ -495,9 +520,22 @@ class RTCRtpReceiver:
         # record TWCC packet
         if self.__twcc_recorder is not None:
             if packet.extensions.transport_sequence_number is not None:
+                # Auto-detect media_ssrc from first RTP packet if not already set
+                if self.__twcc_recorder.media_ssrc is None:
+                    self.__twcc_recorder.set_media_ssrc(packet.ssrc)
+
+                # arrival_time_us is already in microseconds with full precision
                 self.__twcc_recorder.record_packet(
-                    packet.extensions.transport_sequence_number
+                    packet.extensions.transport_sequence_number,
+                    arrival_time_us=arrival_time_us
                 )
+            else:
+                # Log first few times to debug why packets aren't being recorded
+                if not hasattr(self, '_twcc_warning_count'):
+                    self._twcc_warning_count = 0
+                if self._twcc_warning_count < 5:
+                    logger.warning(f"⚠️  RTP packet missing transport_sequence_number extension (SSRC={packet.ssrc})")
+                    self._twcc_warning_count += 1
 
         # keep track of sources
         self.__active_ssrc[packet.ssrc] = clock.current_datetime()
@@ -599,18 +637,74 @@ class RTCRtpReceiver:
                     packet = RtcpRrPacket(ssrc=self.__rtcp_ssrc, reports=reports)
                     await self._send_rtcp(packet)
 
-                # TWCC feedback
-                if self.__twcc_recorder is not None:
-                    feedback = self.__twcc_recorder.generate_feedback()
-                    if feedback is not None:
-                        self.__log_debug("> TWCC feedback %d bytes", len(feedback))
-                        await self._send_rtcp_raw(feedback)
+                # Note: TWCC feedback is now sent in a separate _run_twcc() loop at 100ms intervals
 
         except asyncio.CancelledError:
             pass
 
         self.__log_debug("- RTCP finished")
         self.__rtcp_exited.set()
+
+    async def _run_twcc(self) -> None:
+        """
+        Dedicated TWCC feedback loop running every 100ms.
+        This is separate from RTCP RR to ensure timely feedback for GCC.
+        Following Pion's implementation pattern.
+        """
+        self.__log_debug("- TWCC feedback started")
+        self.__twcc_started.set()
+
+        # Open file for dumping TWCC packets (for debugging)
+        import os
+        twcc_dump_path = "/tmp/aiortc_twcc_packets.bin"
+        twcc_dump = None
+        try:
+            twcc_dump = open(twcc_dump_path, "wb")
+            logger.info(f"📝 TWCC packet dump: {twcc_dump_path}")
+        except Exception as e:
+            logger.warning(f"Could not open TWCC dump file: {e}")
+
+        try:
+            while True:
+                # 100ms interval (aligned with Pion's implementation)
+                await asyncio.sleep(0.1)
+
+                # Generate and send TWCC feedback
+                if self.__twcc_recorder is not None:
+                    feedback = self.__twcc_recorder.generate_feedback()
+                    if feedback is not None:
+                        # Dump packet to file for analysis
+                        if twcc_dump:
+                            try:
+                                # Write packet length (4 bytes) then packet data
+                                twcc_dump.write(len(feedback).to_bytes(4, byteorder='big'))
+                                twcc_dump.write(feedback)
+                                twcc_dump.flush()
+                            except Exception as e:
+                                logger.warning(f"Failed to dump TWCC packet: {e}")
+
+                        # Decode packet status count from feedback
+                        # TWCC packet format: [header(4)] [sender_ssrc(4)] [media_ssrc(4)] [base_seq(2)] [pkt_status_count(2)] [ref_time(3)] [fb_count(1)] [...]
+                        # Packet status count is at bytes 14-15
+                        if len(feedback) >= 16:
+                            packet_status_count = int.from_bytes(feedback[14:16], 'big')
+                            logger.info(f"📡 TWCC: Sending feedback ({len(feedback)} bytes, {packet_status_count} pkts in report)")
+                        else:
+                            logger.info(f"📡 TWCC: Sending feedback ({len(feedback)} bytes)")
+                        await self._send_rtcp_raw(feedback)
+
+        except asyncio.CancelledError:
+            pass
+        finally:
+            if twcc_dump:
+                try:
+                    twcc_dump.close()
+                    logger.info(f"📝 TWCC packet dump closed")
+                except Exception:
+                    pass
+
+        self.__log_debug("- TWCC feedback finished")
+        self.__twcc_exited.set()
 
     async def _send_rtcp(self, packet: AnyRtcpPacket) -> None:
         self.__log_debug("> %s", packet)
@@ -623,8 +717,10 @@ class RTCRtpReceiver:
         """Send raw RTCP data (for TWCC feedback)."""
         try:
             await self.transport._send_rtp(data)
-        except ConnectionError:
-            pass
+        except ConnectionError as e:
+            logger.warning(f"⚠️  Failed to send TWCC feedback: ConnectionError - {e}")
+        except Exception as e:
+            logger.error(f"❌ Unexpected error sending TWCC feedback: {type(e).__name__} - {e}")
 
     async def _send_rtcp_nack(self, media_ssrc: int, lost: list[int]) -> None:
         """

@@ -1,0 +1,16 @@
+{
+  "name": "chromium-twcc-peer",
+  "version": "1.0.0",
+  "description": "Chromium WebRTC peer with TWCC for testing against aiortc",
+  "main": "peer_twcc.js",
+  "scripts": {
+    "start": "node peer_twcc.js"
+  },
+  "dependencies": {
+    "playwright": "^1.40.0",
+    "node-fetch": "^3.3.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

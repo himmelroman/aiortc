@@ -623,7 +623,7 @@ class RTCDtlsTransport(AsyncIOEventEmitter):
             for recipient in self._rtp_router.route_rtcp(packet):
                 await recipient._handle_rtcp_packet(packet)
 
-    async def _handle_rtp_data(self, data: bytes, arrival_time_ms: int) -> None:
+    async def _handle_rtp_data(self, data: bytes, arrival_time_us: int) -> None:
         try:
             packet = RtpPacket.parse(data, self._rtp_header_extensions_map)
         except ValueError as exc:
@@ -633,7 +633,7 @@ class RTCDtlsTransport(AsyncIOEventEmitter):
         # route RTP packet
         receiver = self._rtp_router.route_rtp(packet)
         if receiver is not None:
-            await receiver._handle_rtp_packet(packet, arrival_time_ms=arrival_time_ms)
+            await receiver._handle_rtp_packet(packet, arrival_time_us=arrival_time_us)
 
     async def _recv_next(self) -> None:
         # get timeout
@@ -674,14 +674,19 @@ class RTCDtlsTransport(AsyncIOEventEmitter):
                 await self._data_receiver._handle_data(data)
         elif first_byte > 127 and first_byte < 192 and self._rx_srtp:
             # SRTP / SRTCP
-            arrival_time_ms = clock.current_ms()
+            # CRITICAL: Use monotonic clock with MICROSECOND precision for arrival times
+            # - Prevents non-monotonic timestamps (system clock can go backwards due to NTP)
+            # - Provides sufficient precision for TWCC deltas (250μs resolution)
+            # - Avoids multiple packets having identical timestamps
+            import time
+            arrival_time_us = int(time.monotonic() * 1_000_000)
             try:
                 if is_rtcp(data):
                     data = self._rx_srtp.unprotect_rtcp(data)
                     await self._handle_rtcp_data(data)
                 else:
                     data = self._rx_srtp.unprotect(data)
-                    await self._handle_rtp_data(data, arrival_time_ms=arrival_time_ms)
+                    await self._handle_rtp_data(data, arrival_time_us=arrival_time_us)
             except pylibsrtp.Error as exc:
                 self.__log_debug("x SRTP unprotect failed: %s", exc)
 

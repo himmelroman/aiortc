@@ -386,15 +386,16 @@ class RTCRtpSender:
         if feedback:
             estimate = self.__gcc_estimator.process_feedback(feedback)
             if estimate is not None:
-                self.__log_debug("+ GCC bandwidth estimate %d bps", estimate)
+                estimate_mbps = estimate / 1_000_000
+                self.__log_debug("+ GCC bandwidth estimate %.2f Mbps (%d kbps)", estimate_mbps, estimate // 1000)
                 # Apply to encoder
                 if self.__encoder and hasattr(self.__encoder, "target_bitrate"):
                     old_bitrate = self.__encoder.target_bitrate
                     self.__encoder.target_bitrate = estimate
                     new_bitrate = self.__encoder.target_bitrate
                     self.__log_debug(
-                        "  Encoder bitrate: %d -> %d bps (requested %d)",
-                        old_bitrate, new_bitrate, estimate
+                        "  Encoder bitrate: %.2f -> %.2f Mbps (requested %.2f Mbps)",
+                        old_bitrate / 1_000_000, new_bitrate / 1_000_000, estimate / 1_000_000
                     )
                 else:
                     self.__log_debug("  Encoder not available or no target_bitrate property")

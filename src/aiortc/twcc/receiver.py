@@ -5,10 +5,13 @@ Handles packet tracking, arrival time recording, and TWCC feedback generation.
 Based on Pion's interceptor/pkg/cc/twcc implementation.
 """
 
+import logging
 import threading
 import time
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
+
+logger = logging.getLogger(__name__)
 
 # Packet status symbols
 PACKET_NOT_RECEIVED = 0
@@ -100,7 +103,7 @@ class ArrivalTimeMap:
     Automatically cleans up old entries to prevent unbounded growth.
     """
 
-    def __init__(self, max_size: int = 1000) -> None:
+    def __init__(self, max_size: int = 10000) -> None:
         self._arrivals: Dict[int, int] = {}  # seq -> arrival_time_us
         self._max_size = max_size
         self._lock = threading.Lock()
@@ -111,10 +114,13 @@ class ArrivalTimeMap:
             self._arrivals[seq] = arrival_time_us
 
             # Clean up old entries if we exceed max size
+            # Note: This should rarely trigger because generate_feedback() calls clear_before()
+            # But we keep it as a safety mechanism
             if len(self._arrivals) > self._max_size:
                 # Remove oldest entries (assuming sequential sequence numbers)
                 min_seq = min(self._arrivals.keys())
                 del self._arrivals[min_seq]
+                logger.warning(f"TWCC: Arrival map exceeded max_size ({self._max_size}), removed packet {min_seq}")
 
     def get(self, seq: int) -> Optional[int]:
         """Get arrival time for a packet."""
@@ -189,7 +195,9 @@ class PacketChunkEncoder:
             if symbol_size == 1:
                 status_bits |= (symbol & 0x1) << (13 - i)
             else:  # symbol_size == 2
-                status_bits |= (symbol & 0x3) << (13 - i * 2)
+                # CRITICAL FIX: Match pion's bit layout exactly
+                # Bits 13-12 for symbol 0, 11-10 for symbol 1, etc.
+                status_bits |= (symbol & 0x3) << (12 - i * 2)
 
         chunk = (STATUS_VECTOR_CHUNK << 15) | ((symbol_size - 1) << 14) | status_bits
         return chunk.to_bytes(2, byteorder='big')
@@ -276,22 +284,41 @@ class ReceiveDeltaEncoder:
         for seq, arrival_time in packets:
             delta_us = arrival_time - last_time
 
+            # CRITICAL: Clamp negative deltas to 0 to prevent Chromium's GCC from throttling
+            # Negative deltas happen when packets arrive out of sequence number order due
+            # to network reordering. Chromium interprets negative deltas as severe congestion
+            # and throttles aggressively. Better to report 0 delta than negative.
+            if delta_us < 0:
+                logger.debug(f"TWCC: Clamping negative delta {delta_us}us to 0 for seq={seq}")
+                delta_us = 0
+
             # Encode delta
-            if abs(delta_us) <= MAX_SMALL_DELTA_US:
-                # Small delta: 1 byte, 250us resolution
-                delta_units = round(delta_us / SMALL_DELTA_US)
-                # Handle negative deltas for small encoding
-                if delta_units < 0:
-                    delta_units += 256
+            # CRITICAL FIX: Small deltas are UNSIGNED in TWCC spec, so negative deltas
+            # MUST use large (2-byte signed) encoding. Otherwise, wrapping -1 to 255
+            # causes pion to decode it as +63.75ms instead of -250us, making times jump forward.
+            if delta_us >= 0 and delta_us <= MAX_SMALL_DELTA_US:
+                # Small delta: 1 byte, 250us resolution (UNSIGNED, only for non-negative)
+                # Match pion's rounding: (delta + scale/2) // scale
+                delta_units = (delta_us + SMALL_DELTA_US // 2) // SMALL_DELTA_US
+                delta_us_rounded = delta_units * SMALL_DELTA_US
                 deltas.append(delta_units.to_bytes(1, byteorder='big', signed=False))
                 statuses.append(PACKET_RECEIVED_SMALL_DELTA)
             else:
-                # Large delta: 2 bytes, 1000us resolution
-                delta_units = round(delta_us / LARGE_DELTA_US)
+                # Large delta: 2 bytes, 1000us resolution (SIGNED, for negative or large positive)
+                # Match pion's rounding: (delta +/- scale/2) // scale
+                if delta_us >= 0:
+                    delta_units = (delta_us + LARGE_DELTA_US // 2) // LARGE_DELTA_US
+                else:
+                    delta_units = (delta_us - LARGE_DELTA_US // 2) // LARGE_DELTA_US
+                delta_us_rounded = delta_units * LARGE_DELTA_US
                 deltas.append(delta_units.to_bytes(2, byteorder='big', signed=True))
                 statuses.append(PACKET_RECEIVED_LARGE_DELTA)
 
-            last_time = arrival_time
+            # CRITICAL FIX: Accumulate using rounded delta, not actual arrival time!
+            # This matches pion's implementation and prevents rounding error accumulation.
+            # If we use actual arrival_time, small rounding errors compound and cause
+            # reconstructed times to drift from encoded values.
+            last_time += delta_us_rounded
 
         return b''.join(deltas), statuses
 
@@ -304,15 +331,26 @@ class TWCCRecorder:
     Tracks packet arrivals and generates TWCC feedback reports.
     """
 
-    def __init__(self, media_ssrc: int) -> None:
+    def __init__(self, sender_ssrc: int, media_ssrc: Optional[int] = None) -> None:
         """
         Initialize TWCC recorder.
 
         Args:
-            media_ssrc: SSRC of the media stream (used for RTCP sender)
+            sender_ssrc: SSRC of the RTCP packet sender (receiver sending feedback)
+            media_ssrc: SSRC of the media stream (optional, will be discovered from RTP packets if not provided)
         """
-        self.media_ssrc = media_ssrc
-        self._arrival_times = ArrivalTimeMap(max_size=5000)
+        # CRITICAL: Use separate sender_ssrc and media_ssrc per RTCP spec
+        # Sender SSRC = who is sending this RTCP packet (the receiver)
+        # Media SSRC = what media stream this feedback is about (the sender's stream)
+        # Using the same SSRC for both violates RTCP spec and may confuse Chromium's GCC
+        self.sender_ssrc = sender_ssrc
+        self.media_ssrc = media_ssrc  # May be None initially, will be set from RTP packets
+        if media_ssrc:
+            logger.info(f"✅ TWCC: Initialized with sender_ssrc=0x{sender_ssrc:08x}, media_ssrc=0x{media_ssrc:08x}")
+        else:
+            logger.info(f"✅ TWCC: Initialized with sender_ssrc=0x{sender_ssrc:08x}, media_ssrc will be auto-detected")
+        # Use large buffer to handle high packet rates (match pion's 2^15 = 32768)
+        self._arrival_times = ArrivalTimeMap(max_size=32768)
         self._unwrapper = SequenceNumberUnwrapper()
         self._lock = threading.Lock()
 
@@ -320,22 +358,75 @@ class TWCCRecorder:
         self._feedback_count = 0
         self._base_seq: Optional[int] = None
         self._last_feedback_seq: Optional[int] = None
+        self._last_feedback_ref_time: Optional[int] = None  # Track last reference time for cross-report monotonicity
 
-    def record_packet(self, transport_seq: int) -> None:
+        # CRITICAL: Use relative time (like Pion) instead of absolute epoch time
+        # This ensures reference times start near 0, not huge values into the epoch
+        # which would break Chromium's GCC delay calculations
+        # NOTE: Must use monotonic clock (matching rtcdtlstransport.py) to ensure
+        # arrival times never go backwards, which would break Chromium's GCC
+        self._start_time_us = int(time.monotonic() * 1_000_000)
+        logger.info(f"✅ TWCC recorder initialized with start_time={self._start_time_us}us (monotonic clock, relative timing enabled)")
+
+        # Track last arrival time to enforce monotonicity (prevents negative deltas)
+        self._last_arrival_time_us: Optional[int] = None
+
+    def set_media_ssrc(self, media_ssrc: int) -> None:
+        """
+        Set the media SSRC (called when first RTP packet arrives).
+
+        Args:
+            media_ssrc: SSRC of the media stream from RTP packets
+        """
+        if self.media_ssrc is None:
+            self.media_ssrc = media_ssrc
+            logger.info(f"✅ TWCC: Auto-detected media_ssrc=0x{media_ssrc:08x} (sender_ssrc=0x{self.sender_ssrc:08x})")
+        elif self.media_ssrc != media_ssrc:
+            logger.warning(f"⚠️  TWCC: Media SSRC changed from 0x{self.media_ssrc:08x} to 0x{media_ssrc:08x}")
+            self.media_ssrc = media_ssrc
+
+    def record_packet(self, transport_seq: int, arrival_time_us: int = None) -> None:
         """
         Record the arrival of a packet with TWCC sequence number.
 
         Args:
             transport_seq: Transport-wide sequence number (16-bit)
+            arrival_time_us: Packet arrival time in microseconds (if None, use current time)
         """
-        arrival_time_us = int(time.time() * 1_000_000)
+        # Use provided arrival time or capture current time
+        # This ensures we use the ACTUAL packet arrival time from the transport layer,
+        # not the time after packet processing which would show artificial delay
+        if arrival_time_us is None:
+            arrival_time_us = time.time_ns() // 1_000
+
+        # CRITICAL: Convert absolute time to relative time (time since recorder started)
+        # This matches Pion's behavior: time.Since(s.startTime).Microseconds()
+        # Without this, reference times would be ~13 hours, breaking Chromium's GCC
+        relative_arrival_time_us = arrival_time_us - self._start_time_us
+
         unwrapped_seq = self._unwrapper.unwrap(transport_seq)
 
         with self._lock:
-            self._arrival_times.add(unwrapped_seq, arrival_time_us)
+            # CRITICAL: Enforce monotonicity to prevent negative deltas
+            # Async packet processing can cause packets to be recorded slightly out of order
+            # Even one negative delta breaks Chromium's GCC
+            if self._last_arrival_time_us is not None:
+                if relative_arrival_time_us <= self._last_arrival_time_us:
+                    # Adjust to be at least 1 microsecond after previous packet
+                    old_time = relative_arrival_time_us
+                    relative_arrival_time_us = self._last_arrival_time_us + 1
+                    logger.debug(f"TWCC: Enforced monotonicity for seq={unwrapped_seq}: {old_time}us → {relative_arrival_time_us}us")
+
+            self._last_arrival_time_us = relative_arrival_time_us
+            self._arrival_times.add(unwrapped_seq, relative_arrival_time_us)
 
             if self._base_seq is None:
                 self._base_seq = unwrapped_seq
+                logger.info(f"TWCC: First packet recorded, base_seq={unwrapped_seq} (transport_seq={transport_seq})")
+
+            # Log every 100th packet for debugging
+            if unwrapped_seq % 100 == 0:
+                logger.debug(f"TWCC: Recorded packet {unwrapped_seq} (transport_seq={transport_seq & 0xFFFF})")
 
     def generate_feedback(self) -> Optional[bytes]:
         """
@@ -344,7 +435,8 @@ class TWCCRecorder:
         Returns RTCP TWCC feedback packet data or None if no data available.
         """
         with self._lock:
-            if self._base_seq is None:
+            if self._base_seq is None or self.media_ssrc is None:
+                # Can't generate feedback until we've received packets and know the media SSRC
                 return None
 
             # Determine sequence range for this feedback
@@ -359,7 +451,13 @@ class TWCCRecorder:
 
             packets = self._arrival_times.get_range(start_seq, end_seq)
             if not packets:
+                # Log at debug level when no packets (this is normal between bursts)
+                total_in_map = len(self._arrival_times._arrivals)
+                logger.debug(f"TWCC: No new packets in range [{start_seq & 0xFFFF}-{end_seq & 0xFFFF}] (map has {total_in_map} total)")
                 return None
+
+            # Log feedback generation
+            logger.info(f"TWCC: Generating feedback for {len(packets)} packets in range [{start_seq & 0xFFFF}-{(start_seq + len(packets) - 1) & 0xFFFF}]")
 
             # Build packet status list (including gaps)
             packet_dict = dict(packets)
@@ -380,8 +478,18 @@ class TWCCRecorder:
                 return None
 
             # Encode deltas and get actual statuses
+            # Use first received packet in sequence order (per TWCC spec)
             first_arrival = received_packets[0][1]
             reference_time = (first_arrival // REFERENCE_TIME_US) * REFERENCE_TIME_US
+
+            # Ensure cross-report monotonicity: reference time must be at least 64ms after previous report
+            # This prevents pion's arrivalGroupAccumulator from dropping packets as "out of order"
+            if self._last_feedback_ref_time is not None:
+                min_ref_time = self._last_feedback_ref_time + REFERENCE_TIME_US
+                if reference_time < min_ref_time:
+                    logger.debug(f"TWCC: Bumping reference time from {reference_time}us to {min_ref_time}us to ensure cross-report monotonicity")
+                    reference_time = min_ref_time
+
             reference_time_24bit = (reference_time // REFERENCE_TIME_US) & 0xFFFFFF
 
             delta_bytes, delta_statuses = ReceiveDeltaEncoder.encode_deltas(
@@ -394,6 +502,26 @@ class TWCCRecorder:
                 if status != PACKET_NOT_RECEIVED:
                     statuses[i] = delta_statuses[status_idx]
                     status_idx += 1
+
+            # DEBUG: Count received packets in statuses
+            num_received_in_statuses = sum(1 for s in statuses if s != PACKET_NOT_RECEIVED)
+            logger.info(f"TWCC DEBUG: {num_received_in_statuses} received in statuses, {len(delta_statuses)} delta_statuses, {len(received_packets)} received_packets, delta_bytes len={len(delta_bytes)}")
+
+            # DEBUG: Check if actual arrival times are monotonic (check ALL packets, not just first 10)
+            non_monotonic_count = 0
+            if len(received_packets) > 1:
+                for i in range(1, len(received_packets)):
+                    seq1, arrival1 = received_packets[i-1]
+                    seq2, arrival2 = received_packets[i]
+                    if arrival2 < arrival1:
+                        non_monotonic_count += 1
+                        if non_monotonic_count <= 5:  # Log first 5 occurrences
+                            logger.warning(f"TWCC: NON-MONOTONIC #{non_monotonic_count}: seq{seq1 & 0xFFFF}@{arrival1}us > seq{seq2 & 0xFFFF}@{arrival2}us (delta={arrival2-arrival1}us)")
+
+            if non_monotonic_count > 0:
+                logger.warning(f"TWCC: {non_monotonic_count} non-monotonic pairs out of {len(received_packets)} packets in this report!")
+
+            logger.debug(f"TWCC: Range seq[{start_seq & 0xFFFF}-{max_seq & 0xFFFF}], {len(received_packets)} pkts, ref_time={reference_time}us, first_arrival={first_arrival}us")
 
             # Encode packet status chunks
             chunk_bytes = PacketChunkEncoder.encode_chunks(statuses)
@@ -410,6 +538,7 @@ class TWCCRecorder:
             # Update state
             self._last_feedback_seq = max_seq
             self._feedback_count = (self._feedback_count + 1) & 0xFF
+            self._last_feedback_ref_time = reference_time  # Track for cross-report monotonicity
 
             # Clean up old arrival times
             self._arrival_times.clear_before(start_seq)
@@ -482,10 +611,11 @@ class TWCCRecorder:
         # Bytes 2-3: Length
         packet.extend(length_words.to_bytes(2, byteorder='big'))
 
-        # Bytes 4-7: SSRC of packet sender (use media SSRC)
-        packet.extend(self.media_ssrc.to_bytes(4, byteorder='big'))
+        # Bytes 4-7: SSRC of packet sender (receiver's RTCP SSRC)
+        # CRITICAL: Must use sender_ssrc here, not media_ssrc, per RTCP spec
+        packet.extend(self.sender_ssrc.to_bytes(4, byteorder='big'))
 
-        # Bytes 8-11: SSRC of media source (use media SSRC)
+        # Bytes 8-11: SSRC of media source (sender's media stream SSRC)
         packet.extend(self.media_ssrc.to_bytes(4, byteorder='big'))
 
         # Bytes 12-13: Base sequence number

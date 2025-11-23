@@ -18,7 +18,7 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_BITRATE = 500000  # 500 kbps
 MIN_BITRATE = 250000  # 250 kbps
-MAX_BITRATE = 10000000  # 10 Mbps (increased from 1.5 Mbps for testing)
+MAX_BITRATE = 50000000  # 50 Mbps (for high-bitrate noise content testing)
 
 MAX_FRAME_RATE = 30
 PACKET_MAX = 1300
@@ -194,20 +194,29 @@ class Vp8Encoder(Encoder):
         if frame.format.name != "yuv420p":
             frame = frame.reformat(format="yuv420p")
 
-        if self.codec and (
-            frame.width != self.codec.width
-            or frame.height != self.codec.height
-            # We only adjust bitrate if it changes by over 10%.
-            or abs(self.target_bitrate - self.codec.bit_rate) / self.codec.bit_rate
-            > 0.1
-        ):
-            self.codec = None
+        if self.codec:
+            bitrate_change_ratio = abs(self.target_bitrate - self.codec.bit_rate) / self.codec.bit_rate
+            should_recreate = (
+                frame.width != self.codec.width
+                or frame.height != self.codec.height
+                # We only adjust bitrate if it changes by over 10%.
+                or bitrate_change_ratio > 0.1
+            )
+            if should_recreate:
+                logger.debug(
+                    f"🔄 VP8: Recreating codec - "
+                    f"current={self.codec.bit_rate/1_000_000:.2f} Mbps, "
+                    f"target={self.target_bitrate/1_000_000:.2f} Mbps, "
+                    f"change={bitrate_change_ratio*100:.1f}%"
+                )
+                self.codec = None
 
         # Force a complete image if a keyframe was requested.
         if force_keyframe:
             frame.pict_type = av.video.frame.PictureType.I
 
         if self.codec is None:
+            logger.debug(f"🏗️  VP8: Creating new codec with bitrate={self.target_bitrate/1_000_000:.2f} Mbps")
             self.codec = av.CodecContext.create("libvpx", "w")
             self.codec.width = frame.width
             self.codec.height = frame.height
@@ -261,8 +270,11 @@ class Vp8Encoder(Encoder):
 
     @target_bitrate.setter
     def target_bitrate(self, bitrate: int) -> None:
+        old_bitrate = self.__target_bitrate
         bitrate = max(MIN_BITRATE, min(bitrate, MAX_BITRATE))
         self.__target_bitrate = bitrate
+        if old_bitrate != bitrate:
+            logger.debug(f"🎯 VP8: target_bitrate changed: {old_bitrate/1_000_000:.2f} -> {bitrate/1_000_000:.2f} Mbps")
 
     @classmethod
     def _packetize(cls, buffer: bytes, picture_id: int) -> list[bytes]:

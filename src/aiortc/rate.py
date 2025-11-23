@@ -40,7 +40,6 @@ class AimdRateControl:
         self.current_bitrate_initialized = False
         self.first_estimated_throughput_time: Optional[int] = None
         self.last_change_ms: Optional[int] = None
-        self.near_max = False
         self.latest_estimated_throughput = 30000000
         self.rtt = 200
         self.state = RateControlState.HOLD
@@ -76,21 +75,27 @@ class AimdRateControl:
         ):
             return None
 
-        # update state
-        if (
-            bandwidth_usage == BandwidthUsage.NORMAL
-            and self.state == RateControlState.HOLD
-        ):
-            self.last_change_ms = now_ms
-            self.state = RateControlState.INCREASE
-        elif bandwidth_usage == BandwidthUsage.OVERUSING:
+        # update state (matches pion/libwebrtc state transitions)
+        if bandwidth_usage == BandwidthUsage.OVERUSING:
+            # Always transition to DECREASE on overuse
             self.state = RateControlState.DECREASE
-        elif bandwidth_usage == BandwidthUsage.UNDERUSING:
-            # UNDERUSING means network has capacity - we should increase!
-            # This was previously HOLD, which prevented GCC from ramping up
-            if self.state != RateControlState.INCREASE:
+        elif self.state == RateControlState.DECREASE:
+            # After DECREASE, must go through HOLD (prevents oscillation)
+            # This matches pion: DECREASE + (NORMAL|UNDER) → HOLD
+            if bandwidth_usage in (BandwidthUsage.NORMAL, BandwidthUsage.UNDERUSING):
+                self.state = RateControlState.HOLD
                 self.last_change_ms = now_ms
-            self.state = RateControlState.INCREASE
+        elif self.state == RateControlState.HOLD:
+            # From HOLD, only NORMAL transitions to INCREASE
+            # UNDER stays in HOLD (matches pion behavior)
+            if bandwidth_usage == BandwidthUsage.NORMAL:
+                self.state = RateControlState.INCREASE
+                self.last_change_ms = now_ms
+        elif self.state == RateControlState.INCREASE:
+            # INCREASE can go to HOLD on underuse, or stay
+            if bandwidth_usage == BandwidthUsage.UNDERUSING:
+                self.state = RateControlState.HOLD
+                self.last_change_ms = now_ms
 
         # helper variables
         new_bitrate = self.current_bitrate
@@ -102,46 +107,69 @@ class AimdRateControl:
 
         # update bitrate
         if self.state == RateControlState.INCREASE:
-            # if the estimated throughput increases significantly,
-            # clear estimated max throughput
-            if self.avg_max_bitrate_kbps is not None:
-                sigma_kbps = math.sqrt(
-                    self.var_max_bitrate_kbps * self.avg_max_bitrate_kbps
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.debug(f"AIMD INCREASE: throughput={estimated_throughput_kbps:.0f} kbps, current_bitrate={self.current_bitrate/1_000_000:.2f} Mbps")
+
+            # Match pion's dynamic near-max detection:
+            # Check if current throughput is WITHIN 3σ of EMA decrease rate
+            # This determines additive vs multiplicative increase each time
+            near_max = False
+            if self.avg_max_bitrate_kbps is not None and self.avg_max_bitrate_kbps > 0:
+                sigma_kbps = math.sqrt(self.var_max_bitrate_kbps)
+                lower_bound = self.avg_max_bitrate_kbps - 3 * sigma_kbps
+                upper_bound = self.avg_max_bitrate_kbps + 3 * sigma_kbps
+
+                import logging
+                logger = logging.getLogger(__name__)
+                logger.debug(
+                    f"INCREASE near-max check: throughput={estimated_throughput_kbps:.0f} kbps, "
+                    f"EMA={self.avg_max_bitrate_kbps:.0f} kbps, "
+                    f"σ={sigma_kbps:.0f} kbps, "
+                    f"band=[{lower_bound:.0f}, {upper_bound:.0f}]"
                 )
-                if (
-                    estimated_throughput_kbps
-                    >= self.avg_max_bitrate_kbps + 3 * sigma_kbps
-                ):
-                    self.near_max = False
+
+                # Check if we're within the band (near previous congestion point)
+                if lower_bound < estimated_throughput_kbps < upper_bound:
+                    near_max = True
+                    logger.debug(f"  → WITHIN band → additive increase")
+                # If we've exceeded the band significantly, clear the EMA
+                elif estimated_throughput_kbps >= upper_bound:
                     self.avg_max_bitrate_kbps = None
+                    logger.debug(f"  → ABOVE band → cleared EMA, multiplicative increase")
+                else:
+                    logger.debug(f"  → BELOW band → multiplicative increase")
 
             # we use additive or multiplicative rate increase depending on whether
             # we are close to the maximum throughput
-            if self.near_max:
-                new_bitrate += self._additive_rate_increase(self.last_change_ms, now_ms)
+            if near_max:
+                increase = self._additive_rate_increase(self.last_change_ms, now_ms)
+                new_bitrate += increase
             else:
-                new_bitrate += self._multiplicative_rate_increase(
+                increase = self._multiplicative_rate_increase(
                     new_bitrate, self.last_change_ms, now_ms
                 )
+                new_bitrate += increase
             self.last_change_ms = now_ms
         elif self.state == RateControlState.DECREASE:
-            # if the estimated throughput drops significantly,
-            # clear estimated max throughput
-            if self.avg_max_bitrate_kbps is not None:
-                sigma_kbps = math.sqrt(
-                    self.var_max_bitrate_kbps * self.avg_max_bitrate_kbps
-                )
-                if (
-                    estimated_throughput_kbps
-                    < self.avg_max_bitrate_kbps - 3 * sigma_kbps
-                ):
-                    self.avg_max_bitrate_kbps = None
+            # Update EMA with the throughput at this decrease point
+            # This builds history of where congestion occurred
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.debug(
+                f"DECREASE: Recording throughput={estimated_throughput_kbps:.0f} kbps in EMA"
+            )
             self._update_max_throughput_estimate(estimated_throughput_kbps)
+            logger.debug(
+                f"  → EMA now={self.avg_max_bitrate_kbps:.0f} kbps, "
+                f"variance={self.var_max_bitrate_kbps:.4f}"
+            )
 
-            self.near_max = True
+            # Match pion: decrease to 85% of estimated throughput
             new_bitrate = round(0.85 * estimated_throughput)
+            logger.debug(f"  → New bitrate: {new_bitrate/1_000_000:.2f} Mbps (85% of throughput)")
             self.last_change_ms = now_ms
-            self.state = RateControlState.HOLD
+            # State transition is now handled above
 
         self.current_bitrate = self._clamp_bitrate(new_bitrate, estimated_throughput)
         return self.current_bitrate
@@ -171,19 +199,24 @@ class AimdRateControl:
         return max(4000, int((avg_packet_size_bits * 1000) / response_time))
 
     def _update_max_throughput_estimate(self, estimated_throughput_kbps: float) -> None:
-        alpha = 0.05
+        # Match pion's EMA alpha: 95% weight on new values for fast adaptation
+        alpha = 0.95
         if self.avg_max_bitrate_kbps is None:
             self.avg_max_bitrate_kbps = estimated_throughput_kbps
         else:
-            self.avg_max_bitrate_kbps = (
-                1 - alpha
-            ) * self.avg_max_bitrate_kbps + alpha * estimated_throughput_kbps
+            # Pion formula: average += alpha * (value - average)
+            # Which is: average = (1-alpha)*average + alpha*value
+            # With alpha=0.95: average = 0.05*old + 0.95*new
+            x = estimated_throughput_kbps - self.avg_max_bitrate_kbps
+            self.avg_max_bitrate_kbps += alpha * x
 
-        norm = max(1, self.avg_max_bitrate_kbps)
-        self.var_max_bitrate_kbps = (1 - alpha) * self.var_max_bitrate_kbps + alpha * (
-            (self.avg_max_bitrate_kbps - estimated_throughput_kbps) ** 2
-        ) / norm
-        self.var_max_bitrate_kbps = max(0.4, min(self.var_max_bitrate_kbps, 2.5))
+        # Update variance similar to pion's approach
+        # variance = (1-alpha)*(variance + alpha*x²)
+        if self.avg_max_bitrate_kbps > 0:
+            x = estimated_throughput_kbps - self.avg_max_bitrate_kbps
+            self.var_max_bitrate_kbps = (1 - alpha) * (
+                self.var_max_bitrate_kbps + alpha * (x ** 2)
+            )
 
 
 class TimestampGroup:

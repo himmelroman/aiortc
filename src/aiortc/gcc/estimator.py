@@ -122,6 +122,9 @@ class DelayBasedController:
         self._overuse_detector = OveruseDetector()
         self._rate_control = AimdRateControl()
 
+        # Track incoming bitrate for clamping (like pion/libwebrtc)
+        self._incoming_bitrate = RateCounter(1000, 8000)
+
         # Initialize rate control
         now_ms = int(time.time() * 1000)
         self._rate_control.set_estimate(initial_bitrate, now_ms)
@@ -148,6 +151,9 @@ class DelayBasedController:
 
         # Process each packet through the delay-based pipeline
         for packet in feedback:
+            # Track incoming bitrate for rate clamping (like pion/libwebrtc)
+            self._incoming_bitrate.add(packet.size, packet.recv_time_us // 1000)
+
             # Convert to abs-send-time format (RTP timestamp)
             # Use send time as timestamp
             timestamp = int(packet.send_time_us / TIMESTAMP_TO_MS)
@@ -187,13 +193,23 @@ class DelayBasedController:
             update_estimate = True
 
         if update_estimate:
-            # For delay-based, we don't have a measured throughput,
-            # so we pass None and let AIMD adjust based on detector state
+            # Get incoming bitrate to clamp increases (prevents wild oscillations)
+            # This matches pion/libwebrtc behavior: limit increase to 1.5× received rate
+            incoming_rate = self._incoming_bitrate.rate(now_ms)
+
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.debug(
+                f"DelayBased update: detector={self._overuse_detector.state()}, "
+                f"incoming_rate={incoming_rate/1_000_000 if incoming_rate else 0:.2f} Mbps"
+            )
+
             target_bitrate = self._rate_control.update(
-                self._overuse_detector.state(), None, now_ms
+                self._overuse_detector.state(), incoming_rate, now_ms
             )
 
             if target_bitrate is not None:
+                logger.debug(f"  → AIMD returned: {target_bitrate/1_000_000:.2f} Mbps")
                 self._last_update_ms = now_ms
                 return target_bitrate
 
@@ -208,59 +224,164 @@ class LossBasedController:
     """
     Loss-based bandwidth estimation controller.
 
-    Reduces bitrate when packet loss is detected.
+    Acts as a limiter on delay-based estimates when packet loss is detected.
+    Based on pion/libwebrtc implementation.
     """
 
-    def __init__(self, initial_bitrate: int = 300000) -> None:
+    # Constants from draft-ietf-rmcat-gcc-02#section-6
+    INCREASE_LOSS_THRESHOLD = 0.02  # 2%
+    INCREASE_TIME_THRESHOLD_MS = 200
+    INCREASE_FACTOR = 1.05  # 5% increase
+
+    DECREASE_LOSS_THRESHOLD = 0.1  # 10%
+    DECREASE_TIME_THRESHOLD_MS = 200
+
+    def __init__(
+        self,
+        initial_bitrate: int = 300000,
+        min_bitrate: int = 100000,
+        max_bitrate: int = 100000000,
+    ) -> None:
         """
         Initialize loss-based controller.
 
         Args:
             initial_bitrate: Initial bitrate in bits per second
+            min_bitrate: Minimum bitrate in bits per second (default 100 kbps)
+            max_bitrate: Maximum bitrate in bits per second (default 100 Mbps)
         """
         self._current_bitrate = initial_bitrate
-        self._last_loss_time_ms: Optional[int] = None
-        self._loss_decrease_factor = 0.5  # Decrease to 50% on loss
+        self._min_bitrate = min_bitrate
+        self._max_bitrate = max_bitrate
+
+        # EMA tracking
+        self._average_loss = 0.0
+        self._last_loss_update_ms: Optional[int] = None
+
+        # Time-gated adjustments
+        self._last_increase_ms: Optional[int] = None
+        self._last_decrease_ms: Optional[int] = None
 
     def update(
         self,
         expected_packets: int,
         received_packets: int,
         now_ms: int,
-    ) -> Optional[int]:
+    ) -> None:
         """
-        Update bandwidth estimate based on packet loss.
+        Update internal loss estimate based on packet loss.
 
         Args:
             expected_packets: Number of expected packets
             received_packets: Number of received packets
             now_ms: Current time in milliseconds
-
-        Returns:
-            Updated bitrate estimate in bps, or None if no loss
         """
         if expected_packets == 0:
-            return None
+            return
 
-        loss_rate = (expected_packets - received_packets) / expected_packets
+        loss_ratio = (expected_packets - received_packets) / expected_packets
 
-        # React to significant loss (> 2%)
-        if loss_rate > 0.02:
-            # Don't decrease too frequently (max once per second)
-            if self._last_loss_time_ms is None or (
-                now_ms - self._last_loss_time_ms > 1000
+        # Update average loss with EMA (200ms time constant)
+        if self._last_loss_update_ms is None:
+            self._average_loss = loss_ratio
+        else:
+            delta_ms = now_ms - self._last_loss_update_ms
+            self._average_loss = self._exponential_moving_average(
+                delta_ms, self._average_loss, loss_ratio
+            )
+        self._last_loss_update_ms = now_ms
+
+        # Determine whether to use average or current for increase/decrease
+        # Pion uses max for increase decision, min for decrease decision
+        increase_loss = max(self._average_loss, loss_ratio)
+        decrease_loss = min(self._average_loss, loss_ratio)
+
+        import logging
+        logger = logging.getLogger(__name__)
+
+        # Check increase condition
+        if increase_loss < self.INCREASE_LOSS_THRESHOLD:
+            if (
+                self._last_increase_ms is None
+                or (now_ms - self._last_increase_ms) > self.INCREASE_TIME_THRESHOLD_MS
             ):
-                self._current_bitrate = int(
-                    self._current_bitrate * self._loss_decrease_factor
+                logger.info(
+                    f"Loss controller increasing; averageLoss: {self._average_loss:.4f}, "
+                    f"decreaseLoss: {decrease_loss:.4f}, increaseLoss: {increase_loss:.4f}"
                 )
-                self._last_loss_time_ms = now_ms
-                return self._current_bitrate
+                self._last_increase_ms = now_ms
+                new_bitrate = int(self.INCREASE_FACTOR * self._current_bitrate)
+                self._current_bitrate = max(
+                    self._min_bitrate, min(new_bitrate, self._max_bitrate)
+                )
 
-        return None
+        # Check decrease condition
+        elif decrease_loss > self.DECREASE_LOSS_THRESHOLD:
+            if (
+                self._last_decrease_ms is None
+                or (now_ms - self._last_decrease_ms) > self.DECREASE_TIME_THRESHOLD_MS
+            ):
+                logger.info(
+                    f"Loss controller decreasing; averageLoss: {self._average_loss:.4f}, "
+                    f"decreaseLoss: {decrease_loss:.4f}, increaseLoss: {increase_loss:.4f}"
+                )
+                self._last_decrease_ms = now_ms
+                # Proportional decrease based on loss
+                new_bitrate = int(self._current_bitrate * (1 - 0.5 * decrease_loss))
+                self._current_bitrate = max(
+                    self._min_bitrate, min(new_bitrate, self._max_bitrate)
+                )
+
+    def get_estimate(self, wanted_rate: int) -> int:
+        """
+        Get loss-limited bandwidth estimate.
+
+        This acts as a limiter on the delay-based estimate.
+        Returns the minimum of the wanted rate and the internal loss-based bitrate.
+
+        Args:
+            wanted_rate: The delay-based estimate to potentially limit
+
+        Returns:
+            Limited bitrate estimate in bps
+        """
+        # Initialize if needed
+        if self._current_bitrate <= 0:
+            self._current_bitrate = max(
+                self._min_bitrate, min(wanted_rate, self._max_bitrate)
+            )
+
+        # Return minimum of wanted rate and internal bitrate (acts as limiter)
+        return min(wanted_rate, self._current_bitrate)
 
     def get_current_estimate(self) -> int:
-        """Get current bitrate estimate."""
+        """Get current internal bitrate estimate."""
         return self._current_bitrate
+
+    def get_average_loss(self) -> float:
+        """Get current average loss ratio."""
+        return self._average_loss
+
+    def _exponential_moving_average(
+        self, delta_ms: int, prev: float, sample: float
+    ) -> float:
+        """
+        Calculate EMA with 200ms time constant.
+
+        Matches pion formula:
+        sample + exp(-delta_ms/200.0) * (prev - sample)
+
+        Args:
+            delta_ms: Time delta in milliseconds
+            prev: Previous average value
+            sample: New sample value
+
+        Returns:
+            Updated average
+        """
+        import math
+
+        return sample + math.exp(-delta_ms / 200.0) * (prev - sample)
 
 
 class SenderSideBandwidthEstimator:
@@ -291,7 +412,9 @@ class SenderSideBandwidthEstimator:
 
         # Controllers
         self._delay_controller = DelayBasedController(initial_bitrate)
-        self._loss_controller = LossBasedController(initial_bitrate)
+        self._loss_controller = LossBasedController(
+            initial_bitrate, min_bitrate, max_bitrate
+        )
 
         # Rate tracking
         self._incoming_bitrate = RateCounter(1000, 8000)
@@ -330,24 +453,52 @@ class SenderSideBandwidthEstimator:
         delay_estimate = self._delay_controller.update(feedback, now_ms)
 
         # Update loss-based controller (calculate expected vs received)
-        # For simplicity, use a sliding window approach
-        if self._last_feedback_time_ms is not None:
-            # Expected packets is based on current sending rate
-            # This is a simplification - real GCC tracks per-SSRC
-            expected = len(feedback)
-            received = len([f for f in feedback])
-            loss_estimate = self._loss_controller.update(expected, received, now_ms)
+        # Count packets in sequence number range to detect loss
+        if feedback and len(feedback) > 0:
+            # Get sequence number range from feedback
+            seq_nums = sorted([p.sequence_number for p in feedback])
+            min_seq = seq_nums[0]
+            max_seq = seq_nums[-1]
 
-            # Combine estimates (use minimum of delay and loss-based)
-            if delay_estimate is not None and loss_estimate is not None:
-                self._current_estimate = min(delay_estimate, loss_estimate)
-            elif delay_estimate is not None:
-                self._current_estimate = delay_estimate
-            elif loss_estimate is not None:
-                self._current_estimate = loss_estimate
+            # Expected packets = full range of sequence numbers
+            expected = max_seq - min_seq + 1
+            # Received packets = number in feedback
+            received = len(feedback)
+
+            loss_rate = (expected - received) / expected if expected > 0 else 0
+
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.debug(
+                f"GCC Loss: expected={expected}, received={received}, "
+                f"loss_rate={loss_rate:.1%}, seq_range=[{min_seq}-{max_seq}]"
+            )
+
+            # Update loss controller's internal state (no return value)
+            if expected > 0:
+                self._loss_controller.update(expected, received, now_ms)
+
+        # Apply loss-based limiter to delay-based estimate
+        # This matches pion's pattern: lossStats := e.lossController.getEstimate(delayStats.TargetBitrate)
+        import logging
+        logger = logging.getLogger(__name__)
+
+        if delay_estimate is not None:
+            # Get loss-limited estimate
+            limited_estimate = self._loss_controller.get_estimate(delay_estimate)
+            self._current_estimate = limited_estimate
+
+            logger.debug(
+                f"GCC Estimates: delay={delay_estimate/1_000_000:.2f} Mbps, "
+                f"loss_limited={limited_estimate/1_000_000:.2f} Mbps, "
+                f"loss_avg={self._loss_controller.get_average_loss():.1%}"
+            )
+            if limited_estimate < delay_estimate:
+                logger.debug(
+                    f"  → Loss controller LIMITING: {delay_estimate/1_000_000:.2f} → {limited_estimate/1_000_000:.2f} Mbps"
+                )
         else:
-            if delay_estimate is not None:
-                self._current_estimate = delay_estimate
+            logger.debug(f"  → No delay estimate, keeping current={self._current_estimate/1_000_000:.2f} Mbps")
 
         self._last_feedback_time_ms = now_ms
 
@@ -392,6 +543,7 @@ class SenderSideBandwidthEstimator:
             "current_estimate_kbps": self._current_estimate / 1000,
             "delay_estimate_bps": self._delay_controller.get_current_estimate(),
             "loss_estimate_bps": self._loss_controller.get_current_estimate(),
+            "loss_average": self._loss_controller.get_average_loss(),
             "incoming_bitrate_bps": self._incoming_bitrate.rate(now_ms),
             "packets_sent": self._packets_sent,
             "packets_received": self._packets_received,
