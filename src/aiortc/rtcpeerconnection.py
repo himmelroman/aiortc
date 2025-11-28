@@ -121,6 +121,8 @@ def find_common_codecs(
             if preferred_pt not in used_pts:
                 codec.payloadType = preferred_pt
                 used_pts.add(preferred_pt)
+                # Update next_pt to optimize future searches
+                next_pt = max(next_pt, preferred_pt + 1)
                 return True
 
         # Phase 2: Collision detected, try ascending from next_pt
@@ -147,14 +149,17 @@ def find_common_codecs(
         if is_rtx(c):
             apt = c.parameters.get("apt")
             if isinstance(apt, int) and apt in common_base:
-                base = common_base[apt]
-                if c.clockRate == base.clockRate:
+                base_codec, base_assigned_pt = common_base[apt]
+                if c.clockRate == base_codec.clockRate:
                     rtx_codec = copy.deepcopy(c)
 
                     # Assign PT using libwebrtc algorithm
                     if not find_and_assign_pt(rtx_codec, c.payloadType):
                         # All PTs exhausted, skip this RTX codec
                         continue
+
+                    # Update apt to reference the base codec's assigned PT
+                    rtx_codec.parameters["apt"] = base_assigned_pt
 
                     common.append(rtx_codec)
             continue
@@ -173,7 +178,8 @@ def find_common_codecs(
                     filter(lambda x: x in c.rtcpFeedback, codec.rtcpFeedback)
                 )
                 common.append(codec)
-                common_base[codec.payloadType] = codec
+                # Store using remote PT as key (for RTX lookup), value is (codec, assigned PT)
+                common_base[c.payloadType] = (codec, codec.payloadType)
                 break
     return common
 
