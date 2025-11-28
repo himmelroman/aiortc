@@ -1,4 +1,5 @@
 import asyncio
+import concurrent.futures
 import logging
 import random
 import time
@@ -50,6 +51,13 @@ from .utils import random16, random32, uint16_add, uint32_add
 logger = logging.getLogger(__name__)
 
 RTT_ALPHA = 0.85
+
+# 🔍 EXPERIMENT: Dedicated thread pool for encoding (8 workers to prevent blocking)
+# This isolates encoding from the default executor to prevent event loop blocking
+_ENCODING_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
+    max_workers=8,
+    thread_name_prefix="aiortc-encoder-"
+)
 
 
 def random_sequence_number() -> int:
@@ -211,7 +219,7 @@ class RTCRtpSender:
         transport_seq_manager,
         initial_bitrate: int = 300000,
         min_bitrate: int = 30000,
-        max_bitrate: int = 2500000,
+        max_bitrate: int = 50000000,
     ) -> None:
         """
         Enable GCC congestion control with TWCC feedback.
@@ -220,7 +228,7 @@ class RTCRtpSender:
             transport_seq_manager: Shared transport sequence number manager
             initial_bitrate: Initial bitrate in bps
             min_bitrate: Minimum bitrate in bps
-            max_bitrate: Maximum bitrate in bps
+            max_bitrate: Maximum bitrate in bps (default 50 Mbps to match encoder capability)
         """
         if self.__gcc_estimator is None:
             from .gcc.estimator import SenderSideBandwidthEstimator
@@ -424,8 +432,9 @@ class RTCRtpSender:
 
             force_keyframe = self.__force_keyframe
             self.__force_keyframe = False
+            # 🔍 EXPERIMENT: Use dedicated encoding executor instead of default
             payloads, timestamp = await self.__loop.run_in_executor(
-                None, self.__encoder.encode, data, force_keyframe
+                _ENCODING_EXECUTOR, self.__encoder.encode, data, force_keyframe
             )
         else:
             # Pack the pre-encoded data.

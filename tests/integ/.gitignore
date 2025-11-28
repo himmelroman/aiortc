@@ -1,0 +1,24 @@
+# Compiled binaries
+pion/peer_twcc
+pion/pion-twcc-client
+
+# Node modules
+node_modules/
+package-lock.json
+
+# Build artifacts
+*.pyc
+__pycache__/
+
+# Test outputs
+*.log
+*.bin
+*.txt
+
+# Docker build cache
+.dockerignore
+
+# Test backups
+pion/go.mod.local_backup
+pion/go.sum.local_backup
+logs/

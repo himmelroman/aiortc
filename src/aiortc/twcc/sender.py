@@ -50,6 +50,7 @@ class SentPacketTracker:
         self._packets: Dict[int, SentPacketInfo] = {}
         self._max_size = max_size
         self._lock = threading.Lock()
+        self._min_seq: Optional[int] = None  # Track minimum sequence number
 
     def add(self, seq: int, size: int, ssrc: int) -> None:
         """Record a sent packet."""
@@ -63,10 +64,20 @@ class SentPacketTracker:
                 ssrc=ssrc
             )
 
-            # Clean up old entries
+            # Update minimum sequence number
+            if self._min_seq is None or seq < self._min_seq:
+                self._min_seq = seq
+
+            # Clean up old entries - O(1) instead of O(n)
             if len(self._packets) > self._max_size:
-                min_seq = min(self._packets.keys())
-                del self._packets[min_seq]
+                if self._min_seq is not None and self._min_seq in self._packets:
+                    del self._packets[self._min_seq]
+                    # Find next minimum (should be min_seq + 1 usually, but handle gaps)
+                    # Since packets arrive mostly in order, try sequential search first
+                    next_seq = self._min_seq + 1
+                    while next_seq not in self._packets and next_seq < seq:
+                        next_seq += 1
+                    self._min_seq = next_seq if next_seq in self._packets else None
 
     def get(self, seq: int) -> Optional[SentPacketInfo]:
         """Get info for a sent packet."""

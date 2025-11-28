@@ -56,6 +56,11 @@ def decoder_worker(
     codec_name = None
     decoder = None
 
+    # RX bottleneck instrumentation
+    frame_count = 0
+    total_decode_time = 0.0
+    last_report_time = time.time()
+
     while True:
         task = input_q.get()
         if task is None:
@@ -68,9 +73,33 @@ def decoder_worker(
             decoder = get_decoder(codec)
             codec_name = codec.name
 
+        # RX bottleneck instrumentation: Time the decode operation
+        decode_start = time.time()
+        frames_decoded = 0
         for frame in decoder.decode(encoded_frame):
+            frames_decoded += 1
             # pass the decoded frame to the track
             asyncio.run_coroutine_threadsafe(output_q.put(frame), loop)
+        decode_time = time.time() - decode_start
+
+        # Track statistics
+        frame_count += frames_decoded
+        total_decode_time += decode_time
+
+        # Report every second
+        now = time.time()
+        if now - last_report_time >= 1.0:
+            elapsed = now - last_report_time
+            avg_decode_ms = (total_decode_time / frame_count * 1000) if frame_count > 0 else 0
+            qsize = input_q.qsize()
+
+            logger.info(f"🔍 DECODER: {frame_count} frames/s, "
+                       f"avg_decode={avg_decode_ms:.1f}ms, queue={qsize}")
+
+            # Reset counters
+            frame_count = 0
+            total_decode_time = 0.0
+            last_report_time = now
 
     if decoder is not None:
         del decoder
@@ -301,6 +330,16 @@ class RTCRtpReceiver:
         self.__remote_streams: dict[int, StreamStatistics] = {}
         self.__rtcp_ssrc: Optional[int] = None
 
+        # RX bottleneck debugging instrumentation
+        self.__rx_debug = {
+            'packets_received': 0,
+            'bytes_received': 0,
+            'frames_queued': 0,
+            'last_report_time': time.time(),
+            'last_report_packets': 0,
+            'last_report_bytes': 0,
+        }
+
         # logging
         self.__log_debug: Callable[..., None] = lambda *args: None
         if logger.isEnabledFor(logging.DEBUG):
@@ -483,15 +522,100 @@ class RTCRtpReceiver:
         elif isinstance(packet, RtcpByePacket):
             self.__stop_decoder()
 
-    async def _handle_rtp_packet(self, packet: RtpPacket, arrival_time_us: int) -> None:
+    async def _handle_rtp_packet(self, packet: RtpPacket, arrival_time_us: int, processing_delay_us: int = 0, timing_data: dict = None) -> None:
         """
         Handle an incoming RTP packet.
 
         Args:
             packet: The RTP packet to handle
             arrival_time_us: Packet arrival time in microseconds (monotonic clock)
+            processing_delay_us: Time spent in SRTP unprotect (microseconds)
+            timing_data: Optional dict with detailed timing breakdowns
         """
         self.__log_debug("< %s", packet)
+
+        # Import profiler
+        from .profiler import get_rtp_profiler
+        profiler = get_rtp_profiler()
+
+        # 🔍 PROFILING: Store timing_data for later (will be updated after TWCC recording)
+        self.__current_packet_timing = timing_data
+
+        # Track processing delay statistics for event loop analysis
+        if not hasattr(self, '__processing_delay_stats'):
+            self.__processing_delay_stats = {
+                'count': 0,
+                'sum': 0,
+                'sum_sq': 0,
+                'min': float('inf'),
+                'max': 0,
+                'last_report_time': time.time(),
+                'last_report_count': 0
+            }
+
+        stats = self.__processing_delay_stats
+        stats['count'] += 1
+        stats['sum'] += processing_delay_us
+        stats['sum_sq'] += processing_delay_us * processing_delay_us
+        stats['min'] = min(stats['min'], processing_delay_us)
+        stats['max'] = max(stats['max'], processing_delay_us)
+
+        # Report every second
+        now = time.time()
+        if now - stats['last_report_time'] >= 1.0:
+            count = stats['count'] - stats['last_report_count']
+            if count > 0:
+                avg = (stats['sum'] / stats['count']) if stats['count'] > 0 else 0
+                variance = (stats['sum_sq'] / stats['count'] - avg * avg) if stats['count'] > 0 else 0
+                stddev = variance ** 0.5 if variance > 0 else 0
+
+                logger.info(f"🔍 PROC_DELAY: {count} pkts/s, "
+                           f"μs: min={stats['min']}, max={stats['max']}, "
+                           f"avg={avg:.0f}, σ={stddev:.0f}")
+
+                # Reset min/max for next period
+                stats['min'] = float('inf')
+                stats['max'] = 0
+                stats['last_report_time'] = now
+                stats['last_report_count'] = stats['count']
+
+        # RX bottleneck instrumentation: Track packet arrival
+        if self.__kind == "video":
+            self.__rx_debug['packets_received'] += 1
+            self.__rx_debug['bytes_received'] += len(packet.payload) + packet.padding_size
+
+            # Report every second
+            now = time.time()
+            if now - self.__rx_debug['last_report_time'] >= 1.0:
+                elapsed = now - self.__rx_debug['last_report_time']
+                packets_delta = self.__rx_debug['packets_received'] - self.__rx_debug['last_report_packets']
+                bytes_delta = self.__rx_debug['bytes_received'] - self.__rx_debug['last_report_bytes']
+
+                pkt_rate = packets_delta / elapsed
+                bitrate_mbps = (bytes_delta * 8) / elapsed / 1_000_000
+
+                decoder_qsize = self.__decoder_queue.qsize()
+                # Count non-None packets in jitter buffer
+                jitter_depth = sum(1 for p in self.__jitter_buffer._packets if p is not None)
+
+                logger.info(f"🔍 RX: {pkt_rate:.1f} pkt/s, {bitrate_mbps:.2f} Mbps, "
+                           f"decoder_q={decoder_qsize}, jitter_buf={jitter_depth}/{self.__jitter_buffer.capacity}, "
+                           f"frames_queued={self.__rx_debug['frames_queued']}")
+
+                self.__rx_debug['last_report_time'] = now
+                self.__rx_debug['last_report_packets'] = self.__rx_debug['packets_received']
+                self.__rx_debug['last_report_bytes'] = self.__rx_debug['bytes_received']
+
+        # Debug logging for first few packets to diagnose TWCC extension
+        if not hasattr(self, '_debug_packet_count'):
+            self._debug_packet_count = 0
+        if self._debug_packet_count < 10:
+            with open('/tmp/aiortc_rtp_debug.txt', 'a') as f:
+                f.write(f"🔍 RTP packet #{self._debug_packet_count}: SSRC={packet.ssrc}, "
+                       f"transport_seq_num={packet.extensions.transport_sequence_number}, "
+                       f"abs_send_time={packet.extensions.abs_send_time}, "
+                       f"twcc_enabled={self.__twcc_recorder is not None}\n")
+            self._debug_packet_count += 1
 
         # If the receiver is disabled, discard the packet.
         if not self._enabled:
@@ -509,6 +633,8 @@ class RTCRtpReceiver:
                 )
                 if self.__rtcp_ssrc is not None and remb is not None:
                     # send Receiver Estimated Maximum Bitrate feedback
+                    bitrate_bps = remb[0]
+                    logger.debug(f"📤 Sending REMB: {bitrate_bps / 1_000_000:.2f} Mbps (SSRCs: {remb[1]})")
                     rtcp_packet = RtcpPsfbPacket(
                         fmt=RTCP_PSFB_APP,
                         ssrc=self.__rtcp_ssrc,
@@ -517,6 +643,23 @@ class RTCRtpReceiver:
                     )
                     await self._send_rtcp(rtcp_packet)
 
+        # Auto-enable TWCC if we receive packets with transport_sequence_number extension
+        # This matches Pion/libwebrtc behavior where TWCC is automatically enabled when
+        # the extension is negotiated in SDP and packets arrive with the extension.
+        if (
+            self.__twcc_recorder is None
+            and packet.extensions.transport_sequence_number is not None
+        ):
+            # Generate RTCP SSRC if not already set
+            if self.__rtcp_ssrc is None:
+                import random
+                self.__rtcp_ssrc = random.randint(0, 2**32 - 1)
+
+            with open('/tmp/aiortc_rtp_debug.txt', 'a') as f:
+                f.write(f"🔧 Auto-enabling TWCC: detected transport_sequence_number on SSRC={packet.ssrc}, RTCP SSRC={self.__rtcp_ssrc}\n")
+            logger.info(f"🔧 Auto-enabling TWCC: detected transport_sequence_number extension on SSRC={packet.ssrc}, using RTCP SSRC={self.__rtcp_ssrc}")
+            self.enable_twcc(self.__rtcp_ssrc)
+
         # record TWCC packet
         if self.__twcc_recorder is not None:
             if packet.extensions.transport_sequence_number is not None:
@@ -524,11 +667,95 @@ class RTCRtpReceiver:
                 if self.__twcc_recorder.media_ssrc is None:
                     self.__twcc_recorder.set_media_ssrc(packet.ssrc)
 
+                # 🔍 PROFILING: Measure TWCC recording time
+                twcc_record_start_us = int(time.monotonic() * 1_000_000)
+
                 # arrival_time_us is already in microseconds with full precision
                 self.__twcc_recorder.record_packet(
                     packet.extensions.transport_sequence_number,
                     arrival_time_us=arrival_time_us
                 )
+
+                # 🔍 PROFILING: Add TWCC recording timing to timing_data
+                twcc_record_done_us = int(time.monotonic() * 1_000_000)
+                twcc_record_delay_us = twcc_record_done_us - twcc_record_start_us
+
+                if timing_data is not None:
+                    timing_data['twcc_record_delay_us'] = twcc_record_delay_us
+                    timing_data['end_to_end_delay_us'] = twcc_record_done_us - timing_data.get('socket_arrival_us', arrival_time_us)
+
+                # 🔍 PROFILING: Report detailed timing statistics
+                # Debug: BEFORE any conditions
+                if not hasattr(self, '_profiling_debug_count'):
+                    self._profiling_debug_count = 0
+                self._profiling_debug_count += 1
+                if self._profiling_debug_count == 1:
+                    logger.info(f"🔍 PROFILING_DEBUG: First packet - timing_data={timing_data is not None}, kind={self.__kind}")
+
+                if timing_data is not None and self.__kind == "video":
+                    if not hasattr(self, '_detailed_timing_stats'):
+                        self._detailed_timing_stats = {
+                            'count': 0,
+                            'recv_delay_sum': 0,
+                            'srtp_delay_sum': 0,
+                            'parse_delay_sum': 0,
+                            'twcc_delay_sum': 0,
+                            'e2e_delay_sum': 0,
+                            'recv_delay_max': 0,
+                            'srtp_delay_max': 0,
+                            'parse_delay_max': 0,
+                            'twcc_delay_max': 0,
+                            'e2e_delay_max': 0,
+                            'last_report_time': time.time(),
+                        }
+                        logger.info(f"🔍 PROFILING_INIT: Stats initialized at time={time.time()}")
+
+                    stats = self._detailed_timing_stats
+                    stats['count'] += 1
+                    stats['recv_delay_sum'] += timing_data.get('recv_delay_us', 0)
+                    stats['srtp_delay_sum'] += timing_data.get('srtp_delay_us', 0)
+                    stats['parse_delay_sum'] += timing_data.get('parse_delay_us', 0)
+                    stats['twcc_delay_sum'] += timing_data.get('twcc_record_delay_us', 0)
+                    stats['e2e_delay_sum'] += timing_data.get('end_to_end_delay_us', 0)
+                    stats['recv_delay_max'] = max(stats['recv_delay_max'], timing_data.get('recv_delay_us', 0))
+                    stats['srtp_delay_max'] = max(stats['srtp_delay_max'], timing_data.get('srtp_delay_us', 0))
+                    stats['parse_delay_max'] = max(stats['parse_delay_max'], timing_data.get('parse_delay_us', 0))
+                    stats['twcc_delay_max'] = max(stats['twcc_delay_max'], timing_data.get('twcc_record_delay_us', 0))
+                    stats['e2e_delay_max'] = max(stats['e2e_delay_max'], timing_data.get('end_to_end_delay_us', 0))
+
+                    # Report every 2 seconds
+                    now = time.time()
+                    time_since_last = now - stats['last_report_time']
+                    if stats['count'] % 1000 == 0:  # Debug every 1000 packets
+                        logger.info(f"🔍 DEBUG_TIMER: count={stats['count']}, time_since_last={time_since_last:.2f}s")
+                    if time_since_last >= 2.0:
+                        if stats['count'] > 0:
+                            avg_recv = stats['recv_delay_sum'] / stats['count']
+                            avg_srtp = stats['srtp_delay_sum'] / stats['count']
+                            avg_parse = stats['parse_delay_sum'] / stats['count']
+                            avg_twcc = stats['twcc_delay_sum'] / stats['count']
+                            avg_e2e = stats['e2e_delay_sum'] / stats['count']
+
+                            logger.info(f"🔍 RTP_PATH_TIMING: {stats['count']} pkts, "
+                                       f"recv: avg={avg_recv:.1f}μs max={stats['recv_delay_max']}μs, "
+                                       f"srtp: avg={avg_srtp:.1f}μs max={stats['srtp_delay_max']}μs, "
+                                       f"parse: avg={avg_parse:.1f}μs max={stats['parse_delay_max']}μs, "
+                                       f"twcc: avg={avg_twcc:.1f}μs max={stats['twcc_delay_max']}μs, "
+                                       f"e2e: avg={avg_e2e:.1f}μs max={stats['e2e_delay_max']}μs")
+
+                            # Reset for next period
+                            stats['count'] = 0
+                            stats['recv_delay_sum'] = 0
+                            stats['srtp_delay_sum'] = 0
+                            stats['parse_delay_sum'] = 0
+                            stats['twcc_delay_sum'] = 0
+                            stats['e2e_delay_sum'] = 0
+                            stats['recv_delay_max'] = 0
+                            stats['srtp_delay_max'] = 0
+                            stats['parse_delay_max'] = 0
+                            stats['twcc_delay_max'] = 0
+                            stats['e2e_delay_max'] = 0
+                            stats['last_report_time'] = now
             else:
                 # Log first few times to debug why packets aren't being recorded
                 if not hasattr(self, '_twcc_warning_count'):
@@ -598,6 +825,11 @@ class RTCRtpReceiver:
             encoded_frame.timestamp = self.__timestamp_mapper.map(
                 encoded_frame.timestamp
             )
+
+            # RX bottleneck instrumentation: Track frame queuing
+            if self.__kind == "video":
+                self.__rx_debug['frames_queued'] += 1
+
             self.__decoder_queue.put((codec, encoded_frame))
 
     async def _run_rtcp(self) -> None:
@@ -664,6 +896,12 @@ class RTCRtpReceiver:
         except Exception as e:
             logger.warning(f"Could not open TWCC dump file: {e}")
 
+        # TWCC feedback timing instrumentation
+        feedback_count = 0
+        last_feedback_time = None
+        feedback_interval_sum = 0.0
+        feedback_interval_count = 0
+
         try:
             while True:
                 # 100ms interval (aligned with Pion's implementation)
@@ -671,8 +909,20 @@ class RTCRtpReceiver:
 
                 # Generate and send TWCC feedback
                 if self.__twcc_recorder is not None:
+                    gen_start = time.time()
                     feedback = self.__twcc_recorder.generate_feedback()
+                    gen_time_ms = (time.time() - gen_start) * 1000
+
                     if feedback is not None:
+                        feedback_count += 1
+                        now = time.time()
+
+                        # Track timing between feedback sends
+                        if last_feedback_time is not None:
+                            interval_ms = (now - last_feedback_time) * 1000
+                            feedback_interval_sum += interval_ms
+                            feedback_interval_count += 1
+
                         # Dump packet to file for analysis
                         if twcc_dump:
                             try:
@@ -688,10 +938,23 @@ class RTCRtpReceiver:
                         # Packet status count is at bytes 14-15
                         if len(feedback) >= 16:
                             packet_status_count = int.from_bytes(feedback[14:16], 'big')
-                            logger.info(f"📡 TWCC: Sending feedback ({len(feedback)} bytes, {packet_status_count} pkts in report)")
+                            base_seq = int.from_bytes(feedback[12:14], 'big')
+                            ref_time_24bit = int.from_bytes(feedback[16:19], 'big')
+
+                            # Report every second (every ~10 feedbacks)
+                            if feedback_count % 10 == 0 and feedback_interval_count > 0:
+                                avg_interval = feedback_interval_sum / feedback_interval_count
+                                logger.info(f"🔍 TWCC_FB: Sent {packet_status_count} pkts in report (base_seq={base_seq}, "
+                                           f"ref_time={ref_time_24bit}), gen_time={gen_time_ms:.1f}ms, "
+                                           f"avg_interval={avg_interval:.1f}ms, count={feedback_count}")
+                                # Reset interval tracking
+                                feedback_interval_sum = 0.0
+                                feedback_interval_count = 0
                         else:
                             logger.info(f"📡 TWCC: Sending feedback ({len(feedback)} bytes)")
+
                         await self._send_rtcp_raw(feedback)
+                        last_feedback_time = now
 
         except asyncio.CancelledError:
             pass

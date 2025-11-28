@@ -16,5 +16,17 @@ echo ""
 echo "=================================================================="
 echo ""
 
+# Start HTTP server to serve test video (in background)
+cd /app
+python3 -m http.server 8888 >/dev/null 2>&1 &
+HTTP_SERVER_PID=$!
+echo "HTTP server started on port 8888 (PID: $HTTP_SERVER_PID) to serve test_video.webm"
+
+# Trap to clean up HTTP server on exit
+trap "kill $HTTP_SERVER_PID 2>/dev/null || true" EXIT INT TERM
+
+# Give HTTP server a moment to start
+sleep 1
+
 # Run the peer
-exec node /app/peer_twcc.js
+exec node /app/peer.js

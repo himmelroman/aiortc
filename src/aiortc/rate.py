@@ -178,8 +178,20 @@ class AimdRateControl:
         return int((now_ms - last_ms) * self._near_max_rate_increase() / 1000)
 
     def _clamp_bitrate(self, new_bitrate: int, estimated_throughput: int) -> int:
-        max_bitrate = max(int(1.5 * estimated_throughput) + 10000, self.current_bitrate)
-        return min(new_bitrate, max_bitrate)
+        # Matches pion/libwebrtc behavior: only apply 1.5× received cap when it's HIGHER than current
+        # This allows probing above current bitrate even when incoming rate is low
+        received_cap = int(1.5 * estimated_throughput) + 10000
+
+        # Only apply cap if it's higher than current (prevents overshoot)
+        # Otherwise allow increase (enables bandwidth discovery)
+        if new_bitrate > received_cap and received_cap > self.current_bitrate:
+            return received_cap
+
+        # Floor to prevent decreases below current
+        if new_bitrate < self.current_bitrate:
+            return self.current_bitrate
+
+        return new_bitrate
 
     def _multiplicative_rate_increase(
         self, new_bitrate: int, last_ms: int, now_ms: int

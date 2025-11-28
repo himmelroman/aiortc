@@ -1,34 +1,22 @@
-# Dockerfile for Pion TWCC Peer with Traffic Control
-# Multi-stage build: compile Go binary, then copy to runtime image
-
-# Stage 1: Build the Go binary
+# Dockerfile for vanilla pion with loss-based BWE
 FROM golang:1.24-alpine AS builder
 
 WORKDIR /build
-
-# Copy go mod files and local dependencies
-COPY go.mod go.sum ./
-COPY local_pion_gcc ./local_pion_gcc
-RUN go mod download
-
-# Copy source code
+COPY go.mod ./
 COPY main.go ./
+RUN go mod download
+RUN go mod tidy
+RUN CGO_ENABLED=0 GOOS=linux go build -o peer_vanilla main.go
 
-# Build for linux/amd64 (or linux/arm64 depending on target)
-RUN CGO_ENABLED=0 GOOS=linux go build -o peer_twcc main.go
-
-# Stage 2: Runtime image with network tools
 FROM nicolaka/netshoot:latest
-
 WORKDIR /app
 
-# Copy binary from builder
-COPY --from=builder /build/peer_twcc /app/peer_twcc
-COPY entrypoint.sh /entrypoint.sh
+# Copy binary and pre-generated test video
+COPY --from=builder /build/peer_vanilla /app/peer_vanilla
+COPY test_video.ivf /app/test_video.ivf
+RUN chmod +x /app/peer_vanilla && ls -lh /app/test_video.ivf
 
-RUN chmod +x /app/peer_twcc /entrypoint.sh
+EXPOSE 8080
 
-# Default server URL
-ENV SERVER_URL="http://host.docker.internal:8080"
-
-ENTRYPOINT ["/entrypoint.sh"]
+# Server mode by default
+CMD ["/app/peer_vanilla"]

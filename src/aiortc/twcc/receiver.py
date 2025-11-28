@@ -8,6 +8,7 @@ Based on Pion's interceptor/pkg/cc/twcc implementation.
 import logging
 import threading
 import time
+from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
@@ -99,28 +100,53 @@ class ArrivalTimeMap:
     """
     Stores arrival times for received packets.
 
-    Maps transport sequence numbers to arrival times.
-    Automatically cleans up old entries to prevent unbounded growth.
+    Maps transport sequence numbers to arrival times with time-based automatic cleanup.
+    Uses OrderedDict to maintain insertion order for efficient FIFO cleanup.
+
+    Inspired by Pion's time-window approach (500ms) and libwebrtc's RemoveOldPackets().
     """
 
+    # Time window for packet retention (like Pion's 500ms window)
+    # Packets older than this are automatically removed to prevent lag buildup
+    PACKET_WINDOW_US = 500_000  # 500 milliseconds in microseconds
+
     def __init__(self, max_size: int = 10000) -> None:
-        self._arrivals: Dict[int, int] = {}  # seq -> arrival_time_us
-        self._max_size = max_size
+        self._arrivals: OrderedDict[int, int] = OrderedDict()  # seq -> arrival_time_us (ordered by insertion)
+        self._max_size = max_size  # Kept for backward compatibility, but time-based cleanup is primary
         self._lock = threading.Lock()
 
     def add(self, seq: int, arrival_time_us: int) -> None:
-        """Record arrival time for a packet."""
+        """
+        Record arrival time for a packet.
+
+        Automatically removes packets older than PACKET_WINDOW_US to prevent lag buildup.
+        Uses efficient FIFO cleanup from OrderedDict front.
+        """
         with self._lock:
+            # Update or add packet (move to end if already exists for reordering handling)
+            if seq in self._arrivals:
+                # Packet already recorded (reordering case) - update time and move to end
+                self._arrivals.move_to_end(seq)
             self._arrivals[seq] = arrival_time_us
 
-            # Clean up old entries if we exceed max size
-            # Note: This should rarely trigger because generate_feedback() calls clear_before()
-            # But we keep it as a safety mechanism
+            # Time-based cleanup: Remove packets older than window
+            # This prevents the feedback lag buildup that was causing 32-second backlogs
+            cutoff_time = arrival_time_us - self.PACKET_WINDOW_US
+
+            # Pop from front until we hit recent packets (amortized O(1))
+            while self._arrivals:
+                # Peek at oldest packet (first item in OrderedDict)
+                oldest_seq, oldest_time = next(iter(self._arrivals.items()))
+                if oldest_time >= cutoff_time:
+                    # All remaining packets are recent enough
+                    break
+                # Remove oldest packet
+                self._arrivals.popitem(last=False)
+
+            # Safety fallback: count-based limit (should rarely trigger with time-based cleanup)
             if len(self._arrivals) > self._max_size:
-                # Remove oldest entries (assuming sequential sequence numbers)
-                min_seq = min(self._arrivals.keys())
-                del self._arrivals[min_seq]
-                logger.warning(f"TWCC: Arrival map exceeded max_size ({self._max_size}), removed packet {min_seq}")
+                oldest_seq, oldest_time = self._arrivals.popitem(last=False)
+                logger.warning(f"TWCC: Arrival map exceeded max_size ({self._max_size}), removed packet {oldest_seq}")
 
     def get(self, seq: int) -> Optional[int]:
         """Get arrival time for a packet."""
@@ -371,6 +397,16 @@ class TWCCRecorder:
         # Track last arrival time to enforce monotonicity (prevents negative deltas)
         self._last_arrival_time_us: Optional[int] = None
 
+        # Track packet arrival times for feedback latency analysis
+        self._packet_arrival_times: dict = {}  # seq -> arrival_time_us
+        self._feedback_latency_stats = {
+            'count': 0,
+            'sum_latency_us': 0,
+            'min_latency_us': float('inf'),
+            'max_latency_us': 0,
+            'last_report_time': 0
+        }
+
     def set_media_ssrc(self, media_ssrc: int) -> None:
         """
         Set the media SSRC (called when first RTP packet arrives).
@@ -420,6 +456,9 @@ class TWCCRecorder:
             self._last_arrival_time_us = relative_arrival_time_us
             self._arrival_times.add(unwrapped_seq, relative_arrival_time_us)
 
+            # Track absolute arrival time for feedback latency measurement
+            self._packet_arrival_times[unwrapped_seq] = int(time.monotonic() * 1_000_000)
+
             if self._base_seq is None:
                 self._base_seq = unwrapped_seq
                 logger.info(f"TWCC: First packet recorded, base_seq={unwrapped_seq} (transport_seq={transport_seq})")
@@ -451,13 +490,41 @@ class TWCCRecorder:
 
             packets = self._arrival_times.get_range(start_seq, end_seq)
             if not packets:
-                # Log at debug level when no packets (this is normal between bursts)
+                # Check if there are packets with higher sequence numbers (gap due to packet loss)
+                # This follows libwebrtc's philosophy: prioritize robustness over completeness
                 total_in_map = len(self._arrival_times._arrivals)
-                logger.debug(f"TWCC: No new packets in range [{start_seq & 0xFFFF}-{end_seq & 0xFFFF}] (map has {total_in_map} total)")
-                return None
+                if total_in_map > 0:
+                    # Find the minimum sequence number still in the arrival map
+                    all_seqs = list(self._arrival_times._arrivals.keys())
+                    if all_seqs:
+                        min_available_seq = min(all_seqs)
+                        # If there are packets beyond our search window, skip the gap
+                        if min_available_seq > end_seq:
+                            gap_size = min_available_seq - start_seq
+                            logger.warning(f"TWCC: Detected sequence gap of {gap_size} packets! "
+                                         f"No packets in range [{start_seq & 0xFFFF}-{end_seq & 0xFFFF}], "
+                                         f"but {total_in_map} packets exist starting at seq {min_available_seq & 0xFFFF}. "
+                                         f"Skipping gap (likely packet loss or arrival map overflow).")
+                            # Clean up the gap to prevent map from filling
+                            self._arrival_times.clear_before(min_available_seq)
+                            # Update state to skip ahead
+                            self._last_feedback_seq = min_available_seq - 1
+                            # Try again with new range
+                            start_seq = min_available_seq
+                            end_seq = start_seq + 100
+                            packets = self._arrival_times.get_range(start_seq, end_seq)
 
-            # Log feedback generation
-            logger.info(f"TWCC: Generating feedback for {len(packets)} packets in range [{start_seq & 0xFFFF}-{(start_seq + len(packets) - 1) & 0xFFFF}]")
+                # If still no packets after gap skip, clean up and return None
+                if not packets:
+                    # CRITICAL: Always clean up to prevent map from filling, even when returning None
+                    # This matches libwebrtc's behavior: prioritize robustness over completeness
+                    self._arrival_times.clear_before(start_seq)
+                    logger.debug(f"TWCC: No new packets in range [{start_seq & 0xFFFF}-{end_seq & 0xFFFF}] (map has {total_in_map} total)")
+                    return None
+
+            # Log feedback generation with first few sequence numbers for correlation with Pion
+            first_few_seqs = [seq & 0xFFFF for seq, _ in packets[:5]]
+            logger.info(f"TWCC: Generating feedback for {len(packets)} packets in range [{start_seq & 0xFFFF}-{(start_seq + len(packets) - 1) & 0xFFFF}], first seqs: {first_few_seqs}")
 
             # Build packet status list (including gaps)
             packet_dict = dict(packets)
@@ -495,6 +562,48 @@ class TWCCRecorder:
             delta_bytes, delta_statuses = ReceiveDeltaEncoder.encode_deltas(
                 received_packets, reference_time
             )
+
+            # Analyze all deltas for jitter detection
+            all_deltas_us = []
+            last_time = reference_time
+            for seq, arrival in received_packets:
+                delta_us = arrival - last_time
+                all_deltas_us.append(delta_us)
+                # Use rounded delta like the encoder does
+                if delta_us >= 0 and delta_us <= 63750:
+                    delta_rounded = ((delta_us + 125) // 250) * 250
+                else:
+                    if delta_us >= 0:
+                        delta_rounded = ((delta_us + 500) // 1000) * 1000
+                    else:
+                        delta_rounded = ((delta_us - 500) // 1000) * 1000
+                last_time += delta_rounded
+
+            # Calculate delta statistics (reveals jitter patterns that GCC uses)
+            if len(all_deltas_us) > 0:
+                min_delta = min(all_deltas_us)
+                max_delta = max(all_deltas_us)
+                avg_delta = sum(all_deltas_us) / len(all_deltas_us)
+                # Calculate stddev
+                if len(all_deltas_us) > 1:
+                    variance = sum((d - avg_delta) ** 2 for d in all_deltas_us) / len(all_deltas_us)
+                    stddev = variance ** 0.5
+                else:
+                    stddev = 0.0
+
+                # Log every 10th feedback (every ~1 second)
+                if (len(packets) % 100 < 10):  # Approximately every second
+                    logger.info(f"🔍 TWCC_DELTA: {len(all_deltas_us)} pkts, "
+                               f"delta μs: min={min_delta}, max={max_delta}, "
+                               f"avg={avg_delta:.0f}, σ={stddev:.0f}, "
+                               f"refTime={reference_time_24bit}")
+
+                    # 🔍 HYPOTHESIS TEST: TWCC delta variance correlates with asyncio scheduling jitter
+                    # Compare this stddev with ASYNCIO_SCHED stddev from rtcdtlstransport.py
+                    # If they're similar (both 3-7ms), it proves asyncio jitter causes TWCC jitter
+                    if stddev > 3000:  # 3ms threshold
+                        logger.warning(f"⚠️  HIGH TWCC DELTA VARIANCE: σ={stddev:.0f}μs - GCC will interpret "
+                                      f"this as congestion and throttle! Compare with ASYNCIO_SCHED σ above.")
 
             # Update statuses with actual delta types
             status_idx = 0
@@ -540,8 +649,43 @@ class TWCCRecorder:
             self._feedback_count = (self._feedback_count + 1) & 0xFF
             self._last_feedback_ref_time = reference_time  # Track for cross-report monotonicity
 
+            # Calculate feedback latency: time from packet arrival to feedback generation
+            feedback_send_time_us = int(time.monotonic() * 1_000_000)
+            for seq, _ in received_packets:
+                if seq in self._packet_arrival_times:
+                    latency_us = feedback_send_time_us - self._packet_arrival_times[seq]
+                    stats = self._feedback_latency_stats
+                    stats['count'] += 1
+                    stats['sum_latency_us'] += latency_us
+                    stats['min_latency_us'] = min(stats['min_latency_us'], latency_us)
+                    stats['max_latency_us'] = max(stats['max_latency_us'], latency_us)
+
+                    # Remove from tracking dict to prevent unbounded growth
+                    del self._packet_arrival_times[seq]
+
+            # Report feedback latency periodically
+            now = time.time()
+            if now - self._feedback_latency_stats['last_report_time'] >= 5.0:
+                stats = self._feedback_latency_stats
+                if stats['count'] > 0:
+                    avg_latency_us = stats['sum_latency_us'] / stats['count']
+                    logger.info(f"🔍 FEEDBACK_LATENCY: {stats['count']} pkts, "
+                               f"μs: min={stats['min_latency_us']}, "
+                               f"max={stats['max_latency_us']}, "
+                               f"avg={avg_latency_us:.0f}")
+                    # Reset for next period
+                    stats['count'] = 0
+                    stats['sum_latency_us'] = 0
+                    stats['min_latency_us'] = float('inf')
+                    stats['max_latency_us'] = 0
+                    stats['last_report_time'] = now
+
             # Clean up old arrival times
             self._arrival_times.clear_before(start_seq)
+            # Clean up old packet arrival tracking (packets we haven't sent feedback for yet)
+            for seq in list(self._packet_arrival_times.keys()):
+                if seq < start_seq:
+                    del self._packet_arrival_times[seq]
 
             return feedback_data
 

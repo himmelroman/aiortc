@@ -1,6 +1,9 @@
+import asyncio
+import concurrent.futures
 import logging
 import multiprocessing
 import random
+import time
 from struct import pack, unpack_from
 from typing import Optional, Type, TypeVar, cast
 
@@ -169,13 +172,48 @@ class VpxPayloadDescriptor:
 class Vp8Decoder(Decoder):
     def __init__(self) -> None:
         self.codec = CodecContext.create("libvpx", "r")
+        # 🔍 PROFILING: Initialize decoder timing stats
+        self._decode_timing_stats = {
+            'count': 0,
+            'total_us': 0,
+            'max_us': 0,
+            'last_report_time': time.time(),
+        }
 
     def decode(self, encoded_frame: JitterFrame) -> list[Frame]:
         try:
+            # 🔍 PROFILING: Measure decode operation time
+            decode_start_us = int(time.monotonic() * 1_000_000)
+
             packet = Packet(encoded_frame.data)
             packet.pts = encoded_frame.timestamp
             packet.time_base = VIDEO_TIME_BASE
-            return cast(list[Frame], self.codec.decode(packet))
+            result = cast(list[Frame], self.codec.decode(packet))
+
+            decode_done_us = int(time.monotonic() * 1_000_000)
+            decode_delay_us = decode_done_us - decode_start_us
+
+            # Update stats
+            stats = self._decode_timing_stats
+            stats['count'] += 1
+            stats['total_us'] += decode_delay_us
+            stats['max_us'] = max(stats['max_us'], decode_delay_us)
+
+            # Report every 2 seconds
+            now = time.time()
+            if now - stats['last_report_time'] >= 2.0:
+                if stats['count'] > 0:
+                    avg_us = stats['total_us'] / stats['count']
+                    logger.info(f"🔍 VP8_DECODE_TIMING: {stats['count']} frames, "
+                               f"avg={avg_us:.1f}μs ({avg_us/1000:.2f}ms), "
+                               f"max={stats['max_us']}μs ({stats['max_us']/1000:.2f}ms)")
+                # Reset stats for next period
+                stats['count'] = 0
+                stats['total_us'] = 0
+                stats['max_us'] = 0
+                stats['last_report_time'] = now
+
+            return result
         except av.FFmpegError as e:
             logger.warning("Vp8Decoder() failed to decode, skipping package: " + str(e))
             return []
@@ -186,6 +224,13 @@ class Vp8Encoder(Encoder):
         self.codec: Optional[VideoCodecContext] = None
         self.picture_id = random.randint(0, (1 << 15) - 1)
         self.__target_bitrate = DEFAULT_BITRATE
+        # 🔍 PROFILING: Initialize encoder timing stats
+        self._encode_timing_stats = {
+            'count': 0,
+            'total_us': 0,
+            'max_us': 0,
+            'last_report_time': time.time(),
+        }
 
     def encode(
         self, frame: Frame, force_keyframe: bool = False
@@ -245,9 +290,35 @@ class Vp8Encoder(Encoder):
                 frame.width * frame.height, multiprocessing.cpu_count()
             )
 
+        # 🔍 PROFILING: Measure encode operation time
+        encode_start_us = int(time.monotonic() * 1_000_000)
+
         data_to_send = b""
         for package in self.codec.encode(frame):
             data_to_send += bytes(package)
+
+        encode_done_us = int(time.monotonic() * 1_000_000)
+        encode_delay_us = encode_done_us - encode_start_us
+
+        # Update stats
+        stats = self._encode_timing_stats
+        stats['count'] += 1
+        stats['total_us'] += encode_delay_us
+        stats['max_us'] = max(stats['max_us'], encode_delay_us)
+
+        # Report every 2 seconds
+        now = time.time()
+        if now - stats['last_report_time'] >= 2.0:
+            if stats['count'] > 0:
+                avg_us = stats['total_us'] / stats['count']
+                logger.info(f"🔍 VP8_ENCODE_TIMING: {stats['count']} frames, "
+                           f"avg={avg_us:.1f}μs ({avg_us/1000:.2f}ms), "
+                           f"max={stats['max_us']}μs ({stats['max_us']/1000:.2f}ms)")
+            # Reset stats for next period
+            stats['count'] = 0
+            stats['total_us'] = 0
+            stats['max_us'] = 0
+            stats['last_report_time'] = now
 
         # Packetize.
         payloads = self._packetize(data_to_send, self.picture_id)

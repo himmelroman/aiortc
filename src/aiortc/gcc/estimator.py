@@ -396,7 +396,7 @@ class SenderSideBandwidthEstimator:
         self,
         initial_bitrate: int = 300000,
         min_bitrate: int = 30000,
-        max_bitrate: int = 2500000,
+        max_bitrate: int = 50000000,
     ) -> None:
         """
         Initialize bandwidth estimator.
@@ -404,7 +404,7 @@ class SenderSideBandwidthEstimator:
         Args:
             initial_bitrate: Initial bitrate in bps (default 300 kbps)
             min_bitrate: Minimum bitrate in bps (default 30 kbps)
-            max_bitrate: Maximum bitrate in bps (default 2.5 mbps)
+            max_bitrate: Maximum bitrate in bps (default 50 Mbps, matching VP8 encoder)
         """
         self.initial_bitrate = initial_bitrate
         self.min_bitrate = min_bitrate

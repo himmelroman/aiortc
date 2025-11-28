@@ -623,17 +623,29 @@ class RTCDtlsTransport(AsyncIOEventEmitter):
             for recipient in self._rtp_router.route_rtcp(packet):
                 await recipient._handle_rtcp_packet(packet)
 
-    async def _handle_rtp_data(self, data: bytes, arrival_time_us: int) -> None:
+    async def _handle_rtp_data(self, data: bytes, arrival_time_us: int, processing_delay_us: int = 0, timing_data: dict = None) -> None:
+        # 🔍 PROFILING: Measure RTP parsing time
+        import time
+        parse_start_us = int(time.monotonic() * 1_000_000)
+
         try:
             packet = RtpPacket.parse(data, self._rtp_header_extensions_map)
         except ValueError as exc:
             self.__log_debug("x RTP parsing failed: %s", exc)
             return
 
+        parse_done_us = int(time.monotonic() * 1_000_000)
+        parse_delay_us = parse_done_us - parse_start_us
+
+        # 🔍 PROFILING: Add parse timing to timing_data
+        if timing_data is None:
+            timing_data = {}
+        timing_data['parse_delay_us'] = parse_delay_us
+
         # route RTP packet
         receiver = self._rtp_router.route_rtp(packet)
         if receiver is not None:
-            await receiver._handle_rtp_packet(packet, arrival_time_us=arrival_time_us)
+            await receiver._handle_rtp_packet(packet, arrival_time_us=arrival_time_us, processing_delay_us=processing_delay_us, timing_data=timing_data)
 
     async def _recv_next(self) -> None:
         # get timeout
@@ -642,6 +654,10 @@ class RTCDtlsTransport(AsyncIOEventEmitter):
             timeout = self._ssl.DTLSv1_get_timeout()
 
         # receive next datagram
+        # 🔍 WALL-CLOCK PROFILING: Measure actual wall-clock time at each step
+        import time
+        t0 = time.monotonic()  # Start
+
         if timeout is not None:
             try:
                 data = await asyncio.wait_for(self.transport._recv(), timeout=timeout)
@@ -652,6 +668,11 @@ class RTCDtlsTransport(AsyncIOEventEmitter):
                 return
         else:
             data = await self.transport._recv()
+
+        t1 = time.monotonic()  # After socket recv
+        recv_delay_us = int((t1 - t0) * 1_000_000)
+
+        socket_arrival_us = int(t1 * 1_000_000)
 
         self.__rx_bytes += len(data)
         self.__rx_packets += 1
@@ -674,19 +695,69 @@ class RTCDtlsTransport(AsyncIOEventEmitter):
                 await self._data_receiver._handle_data(data)
         elif first_byte > 127 and first_byte < 192 and self._rx_srtp:
             # SRTP / SRTCP
-            # CRITICAL: Use monotonic clock with MICROSECOND precision for arrival times
-            # - Prevents non-monotonic timestamps (system clock can go backwards due to NTP)
-            # - Provides sufficient precision for TWCC deltas (250μs resolution)
-            # - Avoids multiple packets having identical timestamps
-            import time
-            arrival_time_us = int(time.monotonic() * 1_000_000)
+            t2 = time.monotonic()  # Before SRTP
+
             try:
                 if is_rtcp(data):
                     data = self._rx_srtp.unprotect_rtcp(data)
+                    t3 = time.monotonic()  # After SRTP
                     await self._handle_rtcp_data(data)
+                    t4 = time.monotonic()  # After handle_rtcp_data
                 else:
+                    # 🔍 WALL-CLOCK PROFILING: Measure each step
                     data = self._rx_srtp.unprotect(data)
-                    await self._handle_rtp_data(data, arrival_time_us=arrival_time_us)
+                    t3 = time.monotonic()  # After SRTP unprotect
+
+                    srtp_delay_us = int((t3 - t2) * 1_000_000)
+
+                    timing_data = {
+                        'socket_arrival_us': socket_arrival_us,
+                        'recv_delay_us': recv_delay_us,
+                        'srtp_delay_us': srtp_delay_us,
+                    }
+
+                    await self._handle_rtp_data(data, arrival_time_us=socket_arrival_us, processing_delay_us=0, timing_data=timing_data)
+                    t4 = time.monotonic()  # After handle_rtp_data
+
+                    # 🔍 WALL-CLOCK: Log timing breakdown every 100th packet
+                    if not hasattr(self, '_packet_timing_counter'):
+                        self._packet_timing_counter = 0
+                        self._timing_stats = {'recv': [], 'srtp': [], 'handle': []}
+
+                    self._packet_timing_counter += 1
+                    handle_delay_us = int((t4 - t3) * 1_000_000)
+
+                    self._timing_stats['recv'].append(recv_delay_us)
+                    self._timing_stats['srtp'].append(srtp_delay_us)
+                    self._timing_stats['handle'].append(handle_delay_us)
+
+                    if self._packet_timing_counter % 100 == 0:
+                        import statistics
+                        recv_avg = statistics.mean(self._timing_stats['recv'])
+                        recv_min = min(self._timing_stats['recv'])
+                        recv_max = max(self._timing_stats['recv'])
+                        recv_stddev = statistics.stdev(self._timing_stats['recv']) if len(self._timing_stats['recv']) > 1 else 0
+
+                        srtp_avg = statistics.mean(self._timing_stats['srtp'])
+                        handle_avg = statistics.mean(self._timing_stats['handle'])
+                        handle_max = max(self._timing_stats['handle'])
+
+                        # 🔍 ASYNCIO SCHEDULING ANALYSIS
+                        # recv_delay_us = time waiting in _recv() call, which includes:
+                        # 1. Kernel buffering (negligible, <100μs)
+                        # 2. ASYNCIO EVENT LOOP SCHEDULING DELAY (1-10ms, the culprit!)
+                        # This is the jitter that appears in TWCC deltas and causes GCC to throttle
+                        logger.info(f"🔍 ASYNCIO_SCHED: recv_delay μs: min={recv_min}, max={recv_max}, "
+                                   f"avg={recv_avg:.0f}, σ={recv_stddev:.0f} | "
+                                   f"srtp_avg={srtp_avg:.0f}μs handle_avg={handle_avg:.0f}μs handle_max={handle_max}μs")
+
+                        # Highlight if scheduling jitter exceeds acceptable threshold
+                        if recv_stddev > 2000:  # 2ms threshold
+                            logger.warning(f"⚠️  HIGH ASYNCIO JITTER: σ={recv_stddev:.0f}μs - This creates artificial "
+                                          f"delay variance in TWCC feedback, causing GCC to throttle!")
+
+                        # Reset stats
+                        self._timing_stats = {'recv': [], 'srtp': [], 'handle': []}
             except pylibsrtp.Error as exc:
                 self.__log_debug("x SRTP unprotect failed: %s", exc)
 
