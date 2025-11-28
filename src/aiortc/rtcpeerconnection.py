@@ -87,41 +87,18 @@ def find_common_codecs(
     """
     Find common codecs between local and remote, negotiating payload types.
 
-    This implements the libwebrtc algorithm for PT assignment with collision detection:
-    1. Prefer the remote's PT if available (minimize changes)
-    2. If collision, search descending from 127 (reduce future collisions)
-
-    Args:
-        local_codecs: Locally supported codecs
-        remote_codecs: Codecs from remote peer
-        used_payload_types: Shared PT set for BUNDLE (session-level tracking).
-                          If None, creates local set (per-media tracking).
-
-    Based on: https://github.com/webrtc-uwp/webrtc/blob/master/pc/media_session.cc
-    UsedIds::FindAndSetIdUsed and FindUnusedId methods.
-
-    In libwebrtc, UsedPayloadTypes maintains session-wide PT namespace for BUNDLE.
-    This matches that behavior when used_payload_types is provided.
+    Implements libwebrtc's PT collision resolution algorithm. When used_payload_types
+    is provided, maintains session-wide PT namespace for BUNDLE (RFC 8834).
     """
     common = []
-    common_base: dict[int, RTCRtpCodecParameters] = {}
+    common_base: dict[int, tuple[RTCRtpCodecParameters, int]] = {}
 
-    # Session-level PT tracking (BUNDLE) or per-media tracking (no BUNDLE)
-    # Matches libwebrtc's UsedPayloadTypes scope
     if used_payload_types is None:
         used_payload_types = set()
-    used_pts: set[int] = used_payload_types  # Track all assigned payload types
+    used_pts: set[int] = used_payload_types
 
     def find_unused_id() -> int | None:
-        """
-        Find an unused payload type ID.
-
-        Equivalent to libwebrtc's UsedIds::FindUnusedId().
-        Returns the first unused id in reverse order to reduce collision risk.
-
-        Returns:
-            Unused PT in range [96, 127], or None if all exhausted
-        """
+        """Find unused PT in range [96, 127], searching descending from 127."""
         for pt in range(rtp.DYNAMIC_PAYLOAD_TYPES.stop - 1,
                         rtp.DYNAMIC_PAYLOAD_TYPES.start - 1, -1):
             if pt not in used_pts:
@@ -129,39 +106,20 @@ def find_common_codecs(
         return None
 
     def find_and_set_id_used(codec: RTCRtpCodecParameters, preferred_id: int) -> bool:
-        """
-        Assign a payload type to a codec, handling collisions.
-
-        Equivalent to libwebrtc's UsedIds::FindAndSetIdUsed().
-
-        Args:
-            codec: The codec to assign a PT to
-            preferred_id: The preferred PT (from remote offer)
-
-        Returns:
-            True if PT was successfully assigned, False if all PTs exhausted
-
-        Algorithm:
-            1. Check if preferred_id is not used → use it (any valid PT)
-            2. If collision in dynamic range, call find_unused_id()
-            3. If collision in static range, fail (can't reassign static PTs)
-        """
-        # Check if preferred PT is available (works for both static and dynamic)
-        if preferred_id not in used_pts:  # IsIdUsed check
+        """Assign PT to codec, handling collisions per libwebrtc algorithm."""
+        if preferred_id not in used_pts:
             codec.payloadType = preferred_id
-            used_pts.add(preferred_id)  # SetIdUsed
+            used_pts.add(preferred_id)
             return True
 
-        # Collision detected
-        # Only reassign if it was a dynamic PT (96-127)
+        # collision - only reassign dynamic PTs
         if preferred_id in rtp.DYNAMIC_PAYLOAD_TYPES:
             unused_id = find_unused_id()
             if unused_id is not None:
                 codec.payloadType = unused_id
-                used_pts.add(unused_id)  # SetIdUsed
+                used_pts.add(unused_id)
                 return True
 
-        # Static PT collision or all dynamic PTs exhausted
         return False
 
     for c in remote_codecs:
@@ -172,15 +130,9 @@ def find_common_codecs(
                 base_codec, base_assigned_pt = common_base[apt]
                 if c.clockRate == base_codec.clockRate:
                     rtx_codec = copy.deepcopy(c)
-
-                    # Assign PT using libwebrtc algorithm
                     if not find_and_set_id_used(rtx_codec, c.payloadType):
-                        # All PTs exhausted, skip this RTX codec
                         continue
-
-                    # Update apt to reference the base codec's assigned PT
                     rtx_codec.parameters["apt"] = base_assigned_pt
-
                     common.append(rtx_codec)
             continue
 
@@ -188,17 +140,12 @@ def find_common_codecs(
         for codec in local_codecs:
             if is_codec_compatible(codec, c):
                 codec = copy.deepcopy(codec)
-
-                # Assign PT using libwebrtc algorithm
                 if not find_and_set_id_used(codec, c.payloadType):
-                    # All PTs exhausted, skip this codec
                     continue
-
                 codec.rtcpFeedback = list(
                     filter(lambda x: x in c.rtcpFeedback, codec.rtcpFeedback)
                 )
                 common.append(codec)
-                # Store using remote PT as key (for RTX lookup), value is (codec, assigned PT)
                 common_base[c.payloadType] = (codec, codec.payloadType)
                 break
     return common
@@ -977,14 +924,11 @@ class RTCPeerConnection(AsyncIOEventEmitter):
         iceCandidates: dict[RTCIceTransport, sdp.MediaDescription] = {}
         trackEvents = []
 
-        # Check for BUNDLE - if active, share PT namespace across all media
-        # Matches libwebrtc's UsedPayloadTypes scope for bundled sessions
+        # share PT namespace across media for BUNDLE
         bundle = next((x for x in description.group if x.semantic == "BUNDLE"), None)
         if bundle and bundle.items:
-            # Session-wide PT tracking for BUNDLE (RFC 8834)
             used_payload_types: Optional[set[int]] = set()
         else:
-            # Per-media PT tracking (no BUNDLE)
             used_payload_types = None
 
         for i, media in enumerate(description.media):
