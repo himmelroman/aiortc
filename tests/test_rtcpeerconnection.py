@@ -510,6 +510,136 @@ class RTCRtpCodecParametersTest(TestCase):
             )
         )
 
+    def test_find_common_codecs_pt_collision_pr1390(self) -> None:
+        """
+        Test PT collision fix for PR #1390.
+        Remote has H264 RTX at PT 103, then VP9 main also at PT 103.
+        """
+        local_codecs = [
+            RTCRtpCodecParameters(
+                mimeType="video/H264",
+                clockRate=90000,
+                payloadType=101,
+                parameters={"profile-level-id": "42e01f"},
+            ),
+            RTCRtpCodecParameters(
+                mimeType="video/rtx",
+                clockRate=90000,
+                payloadType=102,
+                parameters={"apt": 101},
+            ),
+            RTCRtpCodecParameters(
+                mimeType="video/VP9", clockRate=90000, payloadType=103
+            ),
+            RTCRtpCodecParameters(
+                mimeType="video/rtx",
+                clockRate=90000,
+                payloadType=104,
+                parameters={"apt": 103},
+            ),
+        ]
+
+        # Remote has collision: H264 RTX and VP9 main both at PT 103
+        remote_codecs = [
+            RTCRtpCodecParameters(
+                mimeType="video/H264",
+                clockRate=90000,
+                payloadType=102,
+                parameters={"profile-level-id": "42e01f"},
+            ),
+            RTCRtpCodecParameters(
+                mimeType="video/rtx",
+                clockRate=90000,
+                payloadType=103,  # RTX for H264 at 102
+                parameters={"apt": 102},
+            ),
+            RTCRtpCodecParameters(
+                mimeType="video/VP9", clockRate=90000, payloadType=103  # COLLISION!
+            ),
+            RTCRtpCodecParameters(
+                mimeType="video/rtx",
+                clockRate=90000,
+                payloadType=104,
+                parameters={"apt": 103},
+            ),
+        ]
+
+        common = find_common_codecs(local_codecs, remote_codecs)
+
+        # Should have 4 codecs with all unique PTs
+        self.assertEqual(len(common), 4)
+        pts = [c.payloadType for c in common]
+        self.assertEqual(len(pts), len(set(pts)), f"PT collision detected! PTs: {pts}")
+
+        # Verify each codec
+        h264 = next(c for c in common if c.mimeType == "video/H264")
+        self.assertEqual(h264.payloadType, 102)
+
+        h264_rtx = next(
+            c for c in common if c.mimeType == "video/rtx" and c.parameters["apt"] == 102
+        )
+        self.assertEqual(h264_rtx.payloadType, 103)
+
+        vp9 = next(c for c in common if c.mimeType == "video/VP9")
+        self.assertNotEqual(vp9.payloadType, 103, "VP9 should not use PT 103")
+        self.assertIn(vp9.payloadType, range(96, 128))
+
+        # VP9 RTX apt should reference VP9's assigned PT
+        vp9_rtx = next(
+            c
+            for c in common
+            if c.mimeType == "video/rtx" and c.parameters["apt"] == vp9.payloadType
+        )
+        self.assertIsNotNone(vp9_rtx)
+
+    def test_find_common_codecs_pt_collision_descending(self) -> None:
+        """
+        Test libwebrtc collision resolution uses descending search.
+        Multiple collisions should allocate from 127 downward.
+        """
+        local_codecs = [
+            RTCRtpCodecParameters(
+                mimeType="video/VP8", clockRate=90000, payloadType=97
+            ),
+            RTCRtpCodecParameters(
+                mimeType="video/VP9", clockRate=90000, payloadType=103
+            ),
+            RTCRtpCodecParameters(
+                mimeType="video/H264",
+                clockRate=90000,
+                payloadType=99,
+                parameters={"profile-level-id": "42e01f"},
+            ),
+        ]
+
+        # Remote uses same PT (100) for all codecs
+        remote_codecs = [
+            RTCRtpCodecParameters(
+                mimeType="video/VP8", clockRate=90000, payloadType=100
+            ),
+            RTCRtpCodecParameters(
+                mimeType="video/VP9", clockRate=90000, payloadType=100
+            ),
+            RTCRtpCodecParameters(
+                mimeType="video/H264",
+                clockRate=90000,
+                payloadType=100,
+                parameters={"profile-level-id": "42e01f"},
+            ),
+        ]
+
+        common = find_common_codecs(local_codecs, remote_codecs)
+
+        self.assertEqual(len(common), 3)
+        pts = [c.payloadType for c in common]
+        self.assertEqual(len(set(pts)), 3)
+
+        # First uses preferred PT 100
+        self.assertEqual(pts[0], 100)
+        # Subsequent use descending search: 127, 126
+        self.assertEqual(pts[1], 127)
+        self.assertEqual(pts[2], 126)
+
 
 class RTCPeerConnectionTest(TestCase):
     def assertBundled(self, pc: RTCPeerConnection) -> None:

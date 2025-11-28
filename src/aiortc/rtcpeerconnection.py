@@ -127,24 +127,26 @@ def find_common_codecs(
             True if PT was successfully assigned, False if all PTs exhausted
 
         Algorithm:
-            1. Check if preferred_id is in valid range and not used → use it
-            2. If collision, call find_unused_id() for descending search
+            1. Check if preferred_id is not used → use it (any valid PT)
+            2. If collision in dynamic range, call find_unused_id()
+            3. If collision in static range, fail (can't reassign static PTs)
         """
-        # Check if preferred PT is in valid range and available
-        if preferred_id in rtp.DYNAMIC_PAYLOAD_TYPES:
-            if preferred_id not in used_pts:  # IsIdUsed check
-                codec.payloadType = preferred_id
-                used_pts.add(preferred_id)  # SetIdUsed
-                return True
-
-        # Collision detected - find unused ID via descending search
-        unused_id = find_unused_id()
-        if unused_id is not None:
-            codec.payloadType = unused_id
-            used_pts.add(unused_id)  # SetIdUsed
+        # Check if preferred PT is available (works for both static and dynamic)
+        if preferred_id not in used_pts:  # IsIdUsed check
+            codec.payloadType = preferred_id
+            used_pts.add(preferred_id)  # SetIdUsed
             return True
 
-        # All PTs exhausted
+        # Collision detected
+        # Only reassign if it was a dynamic PT (96-127)
+        if preferred_id in rtp.DYNAMIC_PAYLOAD_TYPES:
+            unused_id = find_unused_id()
+            if unused_id is not None:
+                codec.payloadType = unused_id
+                used_pts.add(unused_id)  # SetIdUsed
+                return True
+
+        # Static PT collision or all dynamic PTs exhausted
         return False
 
     for c in remote_codecs:
