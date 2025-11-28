@@ -38,7 +38,7 @@ from .rtcrtpreceiver import (
     RTCRtpSynchronizationSource,
 )
 from .rtcrtpsender import RTCRtpSender
-from .rtcrtptransceiver import RTCRtpTransceiver, sort_codecs_by_mime_types
+from .rtcrtptransceiver import RTCRtpTransceiver
 from .rtcsctptransport import RTCSctpCapabilities, RTCSctpTransport
 from .rtcsessiondescription import RTCSessionDescription
 from .stats import (
@@ -97,5 +97,4 @@ __all__ = [
     "RTCStatsReport",
     "RTCTransportStats",
     "VideoStreamTrack",
-    "sort_codecs_by_mime_types",
 ]
