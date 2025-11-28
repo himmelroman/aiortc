@@ -55,12 +55,15 @@ def create_local_tracks(
 
 
 def force_codec(pc: RTCPeerConnection, sender: RTCRtpSender, forced_codec: str) -> None:
-    kind = forced_codec.split("/")[0]
-    codecs = RTCRtpSender.getCapabilities(kind).codecs
+    """
+    Force a specific codec for a sender.
+
+    This demonstrates the simplified codec selection API - you can now pass
+    MIME type strings directly to setCodecPreferences.
+    """
     transceiver = next(t for t in pc.getTransceivers() if t.sender == sender)
-    transceiver.setCodecPreferences(
-        [codec for codec in codecs if codec.mimeType == forced_codec]
-    )
+    # New simpler API: just pass the MIME type string
+    transceiver.setCodecPreferences([forced_codec])
 
 
 async def index(request: web.Request) -> web.Response:
