@@ -83,8 +83,65 @@ def find_common_codecs(
     local_codecs: list[RTCRtpCodecParameters],
     remote_codecs: list[RTCRtpCodecParameters],
 ) -> list[RTCRtpCodecParameters]:
+    """
+    Find common codecs between local and remote, negotiating payload types.
+
+    This implements the libwebrtc algorithm for PT assignment with collision detection:
+    1. Prefer the remote's PT if available
+    2. If collision, search ascending from next available PT
+    3. If ascending fails, search descending from 127
+
+    Based on: https://github.com/webrtc-uwp/webrtc/blob/master/pc/media_session.cc
+    """
     common = []
     common_base: dict[int, RTCRtpCodecParameters] = {}
+    used_pts: set[int] = set()  # Track all assigned payload types
+    next_pt = rtp.DYNAMIC_PAYLOAD_TYPES.start  # 96
+
+    def find_and_assign_pt(codec: RTCRtpCodecParameters, preferred_pt: int) -> bool:
+        """
+        Assign a payload type to a codec, handling collisions.
+
+        Args:
+            codec: The codec to assign a PT to
+            preferred_pt: The preferred PT (usually from remote)
+
+        Returns:
+            True if PT was successfully assigned, False if all PTs exhausted
+
+        Algorithm (from libwebrtc UsedIds::FindAndSetIdUsed):
+            Phase 1: Check if preferred PT is available
+            Phase 2: Search ascending from next_pt
+            Phase 3: Search descending from max (127)
+        """
+        nonlocal next_pt
+
+        # Phase 1: Try the preferred PT (from remote offer)
+        if preferred_pt in rtp.DYNAMIC_PAYLOAD_TYPES:
+            if preferred_pt not in used_pts:
+                codec.payloadType = preferred_pt
+                used_pts.add(preferred_pt)
+                return True
+
+        # Phase 2: Collision detected, try ascending from next_pt
+        for pt in range(next_pt, rtp.DYNAMIC_PAYLOAD_TYPES.stop):
+            if pt not in used_pts:
+                codec.payloadType = pt
+                used_pts.add(pt)
+                next_pt = pt + 1
+                return True
+
+        # Phase 3: Ascending exhausted, try descending from max
+        for pt in range(rtp.DYNAMIC_PAYLOAD_TYPES.stop - 1,
+                        rtp.DYNAMIC_PAYLOAD_TYPES.start - 1, -1):
+            if pt not in used_pts:
+                codec.payloadType = pt
+                used_pts.add(pt)
+                return True
+
+        # All PTs exhausted
+        return False
+
     for c in remote_codecs:
         # for RTX, check we accepted the base codec
         if is_rtx(c):
@@ -92,15 +149,26 @@ def find_common_codecs(
             if isinstance(apt, int) and apt in common_base:
                 base = common_base[apt]
                 if c.clockRate == base.clockRate:
-                    common.append(copy.deepcopy(c))
+                    rtx_codec = copy.deepcopy(c)
+
+                    # Assign PT using libwebrtc algorithm
+                    if not find_and_assign_pt(rtx_codec, c.payloadType):
+                        # All PTs exhausted, skip this RTX codec
+                        continue
+
+                    common.append(rtx_codec)
             continue
 
         # handle other codecs
         for codec in local_codecs:
             if is_codec_compatible(codec, c):
                 codec = copy.deepcopy(codec)
-                if c.payloadType in rtp.DYNAMIC_PAYLOAD_TYPES:
-                    codec.payloadType = c.payloadType
+
+                # Assign PT using libwebrtc algorithm
+                if not find_and_assign_pt(codec, c.payloadType):
+                    # All PTs exhausted, skip this codec
+                    continue
+
                 codec.rtcpFeedback = list(
                     filter(lambda x: x in c.rtcpFeedback, codec.rtcpFeedback)
                 )
