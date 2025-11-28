@@ -82,6 +82,7 @@ def filter_preferred_codecs(
 def find_common_codecs(
     local_codecs: list[RTCRtpCodecParameters],
     remote_codecs: list[RTCRtpCodecParameters],
+    used_payload_types: Optional[set[int]] = None,
 ) -> list[RTCRtpCodecParameters]:
     """
     Find common codecs between local and remote, negotiating payload types.
@@ -90,12 +91,26 @@ def find_common_codecs(
     1. Prefer the remote's PT if available (minimize changes)
     2. If collision, search descending from 127 (reduce future collisions)
 
+    Args:
+        local_codecs: Locally supported codecs
+        remote_codecs: Codecs from remote peer
+        used_payload_types: Shared PT set for BUNDLE (session-level tracking).
+                          If None, creates local set (per-media tracking).
+
     Based on: https://github.com/webrtc-uwp/webrtc/blob/master/pc/media_session.cc
     UsedIds::FindAndSetIdUsed and FindUnusedId methods.
+
+    In libwebrtc, UsedPayloadTypes maintains session-wide PT namespace for BUNDLE.
+    This matches that behavior when used_payload_types is provided.
     """
     common = []
     common_base: dict[int, RTCRtpCodecParameters] = {}
-    used_pts: set[int] = set()  # Track all assigned payload types
+
+    # Session-level PT tracking (BUNDLE) or per-media tracking (no BUNDLE)
+    # Matches libwebrtc's UsedPayloadTypes scope
+    if used_payload_types is None:
+        used_payload_types = set()
+    used_pts: set[int] = used_payload_types  # Track all assigned payload types
 
     def find_unused_id() -> int | None:
         """
@@ -961,6 +976,17 @@ class RTCPeerConnection(AsyncIOEventEmitter):
         # apply description
         iceCandidates: dict[RTCIceTransport, sdp.MediaDescription] = {}
         trackEvents = []
+
+        # Check for BUNDLE - if active, share PT namespace across all media
+        # Matches libwebrtc's UsedPayloadTypes scope for bundled sessions
+        bundle = next((x for x in description.group if x.semantic == "BUNDLE"), None)
+        if bundle and bundle.items:
+            # Session-wide PT tracking for BUNDLE (RFC 8834)
+            used_payload_types: Optional[set[int]] = set()
+        else:
+            # Per-media PT tracking (no BUNDLE)
+            used_payload_types = None
+
         for i, media in enumerate(description.media):
             dtlsTransport: Optional[RTCDtlsTransport] = None
             self.__seenMids.add(media.rtp.muxId)
@@ -981,7 +1007,9 @@ class RTCPeerConnection(AsyncIOEventEmitter):
 
                 # negotiate codecs
                 common = filter_preferred_codecs(
-                    find_common_codecs(CODECS[media.kind], media.rtp.codecs),
+                    find_common_codecs(
+                        CODECS[media.kind], media.rtp.codecs, used_payload_types
+                    ),
                     transceiver._preferred_codecs,
                 )
 

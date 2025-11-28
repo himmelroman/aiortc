@@ -640,6 +640,63 @@ class RTCRtpCodecParametersTest(TestCase):
         self.assertEqual(pts[1], 127)
         self.assertEqual(pts[2], 126)
 
+    def test_find_common_codecs_bundle_collision(self) -> None:
+        """
+        Test BUNDLE PT collision prevention across media types.
+        When BUNDLE is active, PTs must be unique across audio and video.
+        """
+        # Shared PT namespace for BUNDLE (session-level)
+        used_payload_types: set[int] = set()
+
+        # Audio codecs
+        local_audio = [
+            RTCRtpCodecParameters(
+                mimeType="audio/opus", clockRate=48000, channels=2, payloadType=96
+            ),
+        ]
+        remote_audio = [
+            RTCRtpCodecParameters(
+                mimeType="audio/opus", clockRate=48000, channels=2, payloadType=97
+            ),
+        ]
+
+        # Video codecs - remote tries to use same PT 97!
+        local_video = [
+            RTCRtpCodecParameters(
+                mimeType="video/VP8", clockRate=90000, payloadType=100
+            ),
+        ]
+        remote_video = [
+            RTCRtpCodecParameters(
+                mimeType="video/VP8", clockRate=90000, payloadType=97  # COLLISION!
+            ),
+        ]
+
+        # Negotiate audio first (uses PT 97)
+        common_audio = find_common_codecs(
+            local_audio, remote_audio, used_payload_types
+        )
+        self.assertEqual(len(common_audio), 1)
+        self.assertEqual(common_audio[0].payloadType, 97)
+        self.assertIn(97, used_payload_types)
+
+        # Negotiate video second (PT 97 already used by audio!)
+        common_video = find_common_codecs(
+            local_video, remote_video, used_payload_types
+        )
+        self.assertEqual(len(common_video), 1)
+
+        # Video should NOT use PT 97 (collision with audio)
+        self.assertNotEqual(common_video[0].payloadType, 97)
+
+        # Video should use descending search: PT 127
+        self.assertEqual(common_video[0].payloadType, 127)
+
+        # Both PTs must be in the shared set and unique
+        self.assertIn(97, used_payload_types)  # audio
+        self.assertIn(127, used_payload_types)  # video
+        self.assertEqual(len(used_payload_types), 2)
+
 
 class RTCPeerConnectionTest(TestCase):
     def assertBundled(self, pc: RTCPeerConnection) -> None:
