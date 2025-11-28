@@ -87,16 +87,15 @@ def find_common_codecs(
     Find common codecs between local and remote, negotiating payload types.
 
     This implements the libwebrtc algorithm for PT assignment with collision detection:
-    1. Prefer the remote's PT if available
-    2. If collision, search ascending from next available PT
-    3. If ascending fails, search descending from 127
+    1. Prefer the remote's PT if available (minimize changes)
+    2. If collision, search descending from 127 (reduce future collisions)
 
     Based on: https://github.com/webrtc-uwp/webrtc/blob/master/pc/media_session.cc
+    UsedIds::FindAndSetIdUsed and FindUnusedId methods.
     """
     common = []
     common_base: dict[int, RTCRtpCodecParameters] = {}
     used_pts: set[int] = set()  # Track all assigned payload types
-    next_pt = rtp.DYNAMIC_PAYLOAD_TYPES.start  # 96
 
     def find_and_assign_pt(codec: RTCRtpCodecParameters, preferred_pt: int) -> bool:
         """
@@ -110,30 +109,22 @@ def find_common_codecs(
             True if PT was successfully assigned, False if all PTs exhausted
 
         Algorithm (from libwebrtc UsedIds::FindAndSetIdUsed):
-            Phase 1: Check if preferred PT is available
-            Phase 2: Search ascending from next_pt
-            Phase 3: Search descending from max (127)
-        """
-        nonlocal next_pt
+            1. Try preferred PT if in valid range and not used
+            2. If collision, search descending from 127 (FindUnusedId)
 
-        # Phase 1: Try the preferred PT (from remote offer)
+        The descending search reduces risk of future collisions by avoiding
+        commonly-used lower PT values, as noted in libwebrtc comments.
+        """
+        # Check if preferred PT is in valid range and available
         if preferred_pt in rtp.DYNAMIC_PAYLOAD_TYPES:
             if preferred_pt not in used_pts:
                 codec.payloadType = preferred_pt
                 used_pts.add(preferred_pt)
-                # Update next_pt to optimize future searches
-                next_pt = max(next_pt, preferred_pt + 1)
                 return True
 
-        # Phase 2: Collision detected, try ascending from next_pt
-        for pt in range(next_pt, rtp.DYNAMIC_PAYLOAD_TYPES.stop):
-            if pt not in used_pts:
-                codec.payloadType = pt
-                used_pts.add(pt)
-                next_pt = pt + 1
-                return True
-
-        # Phase 3: Ascending exhausted, try descending from max
+        # Collision detected - search descending from max (FindUnusedId)
+        # libwebrtc: "Returns the first unused id in reverse order.
+        # This hopefully reduce the risk of more collisions."
         for pt in range(rtp.DYNAMIC_PAYLOAD_TYPES.stop - 1,
                         rtp.DYNAMIC_PAYLOAD_TYPES.start - 1, -1):
             if pt not in used_pts:

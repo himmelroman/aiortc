@@ -145,10 +145,12 @@ class PTCollisionTestCase(unittest.TestCase):
 
     def test_libwebrtc_algorithm_phases(self):
         """
-        Test the 3-phase libwebrtc algorithm:
-        Phase 1: Prefer remote PT
-        Phase 2: Ascending search from next_pt
-        Phase 3: Descending search from 127
+        Test the libwebrtc collision resolution algorithm:
+        Phase 1: Prefer remote PT if available
+        Phase 2: If collision, search descending from 127 (FindUnusedId)
+
+        The descending search reduces collision risk by avoiding commonly-used
+        lower PT values, as documented in libwebrtc source.
         """
         local_codecs = [
             RTCRtpCodecParameters(
@@ -165,7 +167,7 @@ class PTCollisionTestCase(unittest.TestCase):
             ),
         ]
 
-        # Remote uses same PT (100) for multiple codecs (forcing phase 2)
+        # Remote uses same PT (100) for multiple codecs (triggering descending search)
         remote_codecs = [
             RTCRtpCodecParameters(
                 mimeType="video/VP8", clockRate=90000, payloadType=100
@@ -192,11 +194,10 @@ class PTCollisionTestCase(unittest.TestCase):
         # First codec should use preferred PT (Phase 1)
         self.assertEqual(pts[0], 100)
 
-        # Second codec should use ascending search (Phase 2) - likely 101
-        self.assertGreater(pts[1], 100)
-
-        # Third codec should use ascending search (Phase 2) - likely 102
-        self.assertGreater(pts[2], pts[1])
+        # Subsequent codecs use descending search: 127, 126, 125...
+        # Second and third codecs should be < 127 (descending from max)
+        self.assertEqual(pts[1], 127)  # First collision uses 127
+        self.assertEqual(pts[2], 126)  # Second collision uses 126
 
     def test_rtx_apt_reference_updated(self):
         """Test that RTX codecs correctly reference their base codec PT."""
