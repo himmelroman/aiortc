@@ -97,40 +97,52 @@ def find_common_codecs(
     common_base: dict[int, RTCRtpCodecParameters] = {}
     used_pts: set[int] = set()  # Track all assigned payload types
 
-    def find_and_assign_pt(codec: RTCRtpCodecParameters, preferred_pt: int) -> bool:
+    def find_unused_id() -> int | None:
+        """
+        Find an unused payload type ID.
+
+        Equivalent to libwebrtc's UsedIds::FindUnusedId().
+        Returns the first unused id in reverse order to reduce collision risk.
+
+        Returns:
+            Unused PT in range [96, 127], or None if all exhausted
+        """
+        for pt in range(rtp.DYNAMIC_PAYLOAD_TYPES.stop - 1,
+                        rtp.DYNAMIC_PAYLOAD_TYPES.start - 1, -1):
+            if pt not in used_pts:
+                return pt
+        return None
+
+    def find_and_set_id_used(codec: RTCRtpCodecParameters, preferred_id: int) -> bool:
         """
         Assign a payload type to a codec, handling collisions.
 
+        Equivalent to libwebrtc's UsedIds::FindAndSetIdUsed().
+
         Args:
             codec: The codec to assign a PT to
-            preferred_pt: The preferred PT (usually from remote)
+            preferred_id: The preferred PT (from remote offer)
 
         Returns:
             True if PT was successfully assigned, False if all PTs exhausted
 
-        Algorithm (from libwebrtc UsedIds::FindAndSetIdUsed):
-            1. Try preferred PT if in valid range and not used
-            2. If collision, search descending from 127 (FindUnusedId)
-
-        The descending search reduces risk of future collisions by avoiding
-        commonly-used lower PT values, as noted in libwebrtc comments.
+        Algorithm:
+            1. Check if preferred_id is in valid range and not used → use it
+            2. If collision, call find_unused_id() for descending search
         """
         # Check if preferred PT is in valid range and available
-        if preferred_pt in rtp.DYNAMIC_PAYLOAD_TYPES:
-            if preferred_pt not in used_pts:
-                codec.payloadType = preferred_pt
-                used_pts.add(preferred_pt)
+        if preferred_id in rtp.DYNAMIC_PAYLOAD_TYPES:
+            if preferred_id not in used_pts:  # IsIdUsed check
+                codec.payloadType = preferred_id
+                used_pts.add(preferred_id)  # SetIdUsed
                 return True
 
-        # Collision detected - search descending from max (FindUnusedId)
-        # libwebrtc: "Returns the first unused id in reverse order.
-        # This hopefully reduce the risk of more collisions."
-        for pt in range(rtp.DYNAMIC_PAYLOAD_TYPES.stop - 1,
-                        rtp.DYNAMIC_PAYLOAD_TYPES.start - 1, -1):
-            if pt not in used_pts:
-                codec.payloadType = pt
-                used_pts.add(pt)
-                return True
+        # Collision detected - find unused ID via descending search
+        unused_id = find_unused_id()
+        if unused_id is not None:
+            codec.payloadType = unused_id
+            used_pts.add(unused_id)  # SetIdUsed
+            return True
 
         # All PTs exhausted
         return False
@@ -145,7 +157,7 @@ def find_common_codecs(
                     rtx_codec = copy.deepcopy(c)
 
                     # Assign PT using libwebrtc algorithm
-                    if not find_and_assign_pt(rtx_codec, c.payloadType):
+                    if not find_and_set_id_used(rtx_codec, c.payloadType):
                         # All PTs exhausted, skip this RTX codec
                         continue
 
@@ -161,7 +173,7 @@ def find_common_codecs(
                 codec = copy.deepcopy(codec)
 
                 # Assign PT using libwebrtc algorithm
-                if not find_and_assign_pt(codec, c.payloadType):
+                if not find_and_set_id_used(codec, c.payloadType):
                     # All PTs exhausted, skip this codec
                     continue
 
